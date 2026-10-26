@@ -100,3 +100,33 @@ short       prompt 124/126/123 tok   40.2/44.7/45.7 tok/s   decode 80.1/118.5/12
 prompt-4k   prompt 4252/4251/4253    568.3/2604.8/2944.9    decode 119.5/130.9/157.4  TTFT 7.94/1.66/1.47 s
 prompt-16k  prompt 16867/16868/16868 3275.9/2352.3/2636.7   decode 153.4/164.1/161.6  TTFT 5.21/7.20/6.43 s
 ```
+
+## 2026-10-26: where the short-prompt TTFT goes (engine trace)
+
+`STRATA_TRACE=1 STRATA_PREFILL_TIMING=1`, sm86set + `STRATA_CKPT_POOL=1`, default `--short-read`. One short request
+(~120 tokens) after the first, from the engine log:
+
+| step | first request after start | later requests |
+|---|---:|---:|
+| park the previous conversation in RAM (`conversation cache: parked N tokens in X ms`) | 2,397 ms | 2,169-2,467 ms while the cache's 4 places are first filled; **34-207 ms** once it reuses memory |
+| batched read of ~115 tokens (`read N tokens (batched)`) | 2,737 ms (GPU: `hc read` 1,059 + `gdn` 966: first use) | 512-585 ms |
+| checkpoint at the turn boundary | 543 ms (new vectors) | 9-10 ms |
+| refill the lent cache slots | 13 ms | 13 ms |
+| assistant header, 6 tokens through the windows | 541 ms | 41-57 ms |
+| **engine prompt time** | 3,931 ms | 2,769-3,053 ms (cold cache) / **707 ms** (warm, earlier log) |
+
+Findings:
+
+- In steady state a ~125-token prompt takes **~0.6-0.7 s** in the engine. The ~2.2-2.5 s seen by the benchmark is parking
+  the previous conversation into the RAM conversation cache: the bench gives every request a new run id, so every request
+  is a new conversation and the old one is parked first. Parking allocates fresh RAM (16 MiB segments, ~240 MB here), and
+  first-touch allocation inside the WSL2 VM ran at ~100 MB/s while Windows itself was nearly out of RAM (61.1 of 61.6 GB).
+  Once the cache holds 4 conversations it frees and refills memory the VM already owns, and parking drops to 34-207 ms.
+- A coding agent continuing its own conversation does not park at all; only switching conversations (another chat, a
+  sub-agent) does. So the short-case TTFT in the tables above is pessimistic for agent use.
+- The first request also pays first-use costs (prompt kernels 5x slower once, a 543 ms checkpoint allocation, and
+  `PCIe share ... pcie_frac 0.60 (was 0.20)` only tuned after it): a start-up warm-up removes these.
+- The engine read 4K prompts in 1.24-1.32 s (3,200-3,440 tok/s) and 16K in 3.85-4.10 s (4,110-4,385 tok/s) in a warm
+  run, faster than the bench's server-side `prompt tok/s` and TTFT suggest (16K TTFT 6.4-7.0 s). The 2-3 s gap at 16K
+  grows with prompt size and is not in the engine's read; the server (template + Python BPE tokenizer) is the suspect,
+  to be measured with per-phase server timings.
