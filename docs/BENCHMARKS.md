@@ -134,3 +134,47 @@ Findings:
 Update: the server now logs one `server phases` line per request and puts the same numbers in `timings` (`server_render_ms`, `server_encode_ms`, `server_queue_ms`, `server_ttft_ms`, ...), and
 `llmserve/bench.py` shows them as rows; `tools/tokenizer_bench.py` measures the Python tokenizer's tokens/s. Run both on the 4090 before assuming the tokenizer is the missing 2-3 s. A start-up
 warm-up (docs/TTFT_WARMUP.md section 3) now removes the first-use costs listed above before the port opens.
+
+## 2026-10-26: 256K context, 2 slots, with and without `--kv-resident 32768` (engine 1cabdd7d)
+
+Settings: `LLMSERVE_CONTEXT=262144`, `LLMSERVE_PARALLEL=2`, `LLMSERVE_BATCH_MTP=on`, `LLMSERVE_BATCH_SWITCHES=on`,
+`LLMSERVE_AGENT=on`, `LLMSERVE_ENGINE_ENV=STRATA_CKPT_POOL=1`, warm-up full, the sm_89 switches built in. "Before" is the same
+256K x 2 slots on the previous image without KV streaming (and without the warm-up and built-in switches).
+
+| | 256K x 2, no KV streaming | 256K x 2, `--kv-resident 32768` |
+|---|---:|---:|
+| GPU expert cache (experts) | 2,661 | **9,857** |
+| agent x1: per-stream decode tok/s | 80.7 | **157.3** |
+| agent x1: TTFT p50 / p95 (s), ~21K prompt 99% cached | 3.28 / 9.87 | 1.87 / 5.80 |
+| agent x2: aggregate tok/s | 66.8 | **119.3** |
+| agent x2: per-stream decode tok/s | 46.8 | 81.2 |
+| agent x2: longest inter-token gap (s) | 3.74 | 5.83 |
+| cold 21K-token prefix TTFT (s) | 13.63 | 6.05 |
+
+KV streaming works under Docker Desktop / WSL2 on this machine, and it is what makes 256K context usable: it gives the
+expert cache back ~3.7x the slots. Single-stream (bench default cases, same settings):
+
+| case | prompt tok/s | decode tok/s | TTFT s | server tokenize ms | engine prompt ms (server clock) |
+|---|---:|---:|---:|---:|---:|
+| short (~123 tok) | 47 | 151.6 | 2.63 | 1 | 2,614 |
+| prompt-4k | 1,581 | 160.9 | 2.72 | 2 | 2,692 |
+| prompt-16k | 2,447 | **171.7** | 6.92 | 6 | 6,893 |
+
+- The fastest decode so far on this machine (16K: 171.7 tok/s vs 161.6 for combo192 at 128K x 1 slot).
+- **The server is not the 2-3 s gap**: template < 1 ms, tokenize 1-22 ms, queue 0, client TTFT - server TTFT 1-2 ms. The
+  whole TTFT is the time from the server sending the request to the engine to the first token. The engine's own
+  `prompt N tokens ... read in X ms` lines (earlier trace: 16K read in 3.85-4.10 s) are shorter than that, so the rest is
+  engine work outside its read clock (parking, checkpoints, work left over from the previous request) - next to trace.
+- 4K prompt reading is slower than at 128K x 1 slot without streaming (1,581 vs 2,605 tok/s); to test: `--kv-resident 65536`.
+
+Join (one stream decoding, a cold ~21K-token prompt arrives):
+
+| | joiner alone | with one decoding stream |
+|---|---:|---:|
+| joiner TTFT (s) | 4.10 | 5.47 |
+| decoding stream tok/s before / while the prompt is read | - | 179.1 / **28.2** |
+| decoding stream's longest gap (s) | - | 1.40 |
+
+The decoding stream drops to ~16% of its speed while another prompt is read (time-sliced on one GPU). That is the
+case for overlapping prompt reading with decode (docs/CONCURRENCY_PLAN.md P3); `STRATA_BATCH_DECODE_SHARE=1.0` is the
+cheap first experiment.
