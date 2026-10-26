@@ -120,6 +120,55 @@ Everything is a variable in `.env` (documented in `.env.example`); `docker compo
   `-march=native` for the PC that builds the image (build and run on the same machine); skip the picture reader; limit compiler jobs when the build runs out of memory.
 - **`LLMSERVE_API_KEY`**: clients must send it. Set it before changing `LLMSERVE_BIND` from `127.0.0.1` to `0.0.0.0` to open the port to your network.
 
+## Benchmark: LLMServe vs original Strata
+
+`llmserve/bench.py` measures one server and compares two saved results. It uses only the Python standard library, so it runs inside the
+container and on plain Windows Python. It sends streamed chat requests (temperature 0, thinking off) for three cases: `short` (a short
+prompt, long answer), `prompt-4k` and `prompt-16k` (a synthetic document of about 4,000 and 16,000 tokens, then "Summarize"). Each request
+starts with a unique run id, so no prompt cache can help. It sends one warm-up request that is not counted, then 3 runs per case, and
+prints the median and min to max of prompt tok/s, decode tok/s, time to first token, token counts and the MTP draft acceptance rate. Speeds
+come from the server's own `timings`; if a server sends none, the client-side numbers are used.
+
+Measure LLMServe (the container is running), then copy the result out:
+
+```powershell
+docker exec llmserve python -m llmserve.bench --label llmserve --out /data/bench-llmserve.json
+docker cp llmserve:/data/bench-llmserve.json .
+```
+
+Measure original Strata running natively on Windows. Stop the container first, because both models will not fit in RAM at once:
+
+```powershell
+docker compose stop
+# start Strata's server the way you normally do and wait until it is ready; its default port is 8095 (use the port its launch printed)
+py llmserve\bench.py --url http://127.0.0.1:8095/v1 --label strata --out bench-strata.json
+```
+
+No Python on Windows? Run the same file from the LLMServe image (the container is stopped, so this only starts the benchmark client):
+
+```powershell
+docker run --rm --entrypoint python -v ${PWD}:/out llmserve:cuda -m llmserve.bench --url http://host.docker.internal:8095/v1 --label strata --out /out/bench-strata.json
+```
+
+Then compare the two files (no server needed; `py llmserve\bench.py --compare ...` works too):
+
+```powershell
+docker run --rm --entrypoint python -v ${PWD}:/out llmserve:cuda -m llmserve.bench --compare /out/bench-llmserve.json /out/bench-strata.json
+```
+
+If the server needs a key, set `LLMSERVE_API_KEY` (or `STRATA_API_KEY`) or pass `--api-key`. Other options: `--runs`, `--cases`
+(`short,prompt-4k,prompt-16k`, or `prompt-32k` and so on), `--max-tokens` (default 512), `--timeout`.
+
+To get a fair result:
+
+- Use the same quant on both (for example Q2_0), the same context size, and MTP on in both.
+- One request at a time: nothing else may talk to either server while it runs, and `LLMSERVE_PARALLEL=1`.
+- Close other heavy programs (games, browsers with many tabs, a second model). Run one server at a time.
+- The first start after a reboot is cold (the model files are not in the page cache yet). Do one full run first, or ignore the first result.
+- Check the "completion tokens" row. If a server stops far below `--max-tokens`, its decode speed is less comparable; the script prints a note.
+- Strata's docs say KV streaming is off under WSL2, so long prompts may read slower in the container than in native Windows Strata.
+  Decode speed should be similar.
+
 ## Linux
 
 The same `docker-compose.yml` works on Linux with Docker Engine and the
@@ -149,6 +198,7 @@ by the WDDM driver. If the data directory must be a host folder, use `volumes: -
 Dockerfile, docker-compose.yml, .env.example   the container
 docker/entrypoint.sh                           checks the machine, runs prepare, execs the server
 llmserve/prepare.py, catalog.py                download, verify, pack, write /data/cfg.json (pins from Strata's setup.py)
+llmserve/bench.py                              stdlib-only speed benchmark and A/B compare (see Benchmark)
 serve/, strata_control/, strata_cli/           Strata's HTTP server (OpenAI / Anthropic API) and what it imports
 src/, include/, CMakeLists.txt, third_party/   Strata's C++/CUDA engine
 tools/, data/                                  model packing tools, expert profile, draft vocabularies
