@@ -46,6 +46,7 @@
 #include <sys/mman.h>
 #endif
 #include <memory>
+#include <mutex>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -582,10 +583,25 @@ uint64_t g_kv_host_bytes = 0;
 // staging buffers. Elsewhere cudaHostAlloc stays first. Either way the other method is the fallback when the first
 // is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first. Like the cudaHostAlloc
 // copy it lives as long as the process.
+//
+// Every copy is recorded, so that `qsa_kv_host_release` can give them all back when a session that streams its K/V cannot be
+// built (generate.cpp then retries with the whole K/V in VRAM): without it the copies of the layers that did get theirs
+// would stay pinned for the life of the process.
+struct KvHostBlock {
+    void* p;
+    uint64_t bytes;
+    bool registered;   // mmap + cudaHostRegister (else cudaHostAlloc)
+};
+std::mutex g_kv_host_mu;
+std::vector<KvHostBlock> g_kv_host_blocks;
 uint8_t* kv_host_alloc(uint64_t bytes) {
     auto host_alloc = [](uint64_t n) -> uint8_t* {
         uint8_t* h = nullptr;
-        if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) return h;
+        if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+            std::lock_guard<std::mutex> lk(g_kv_host_mu);
+            g_kv_host_blocks.push_back({h, n, false});
+            return h;
+        }
         (void) cudaGetLastError();
         return nullptr;
     };
@@ -609,6 +625,10 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
         if (!said) {
             std::fprintf(stderr, "strata: KV streaming: the host copy is pinned with cudaHostRegister\n");
             said = true;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_kv_host_mu);
+            g_kv_host_blocks.push_back({m, n, true});
         }
         return (uint8_t*) m;
     };
@@ -770,6 +790,30 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+uint64_t qsa_kv_host_release() {
+    std::vector<KvHostBlock> blocks;
+    {
+        std::lock_guard<std::mutex> lk(g_kv_host_mu);
+        blocks.swap(g_kv_host_blocks);
+    }
+    uint64_t freed = 0;
+    for (const KvHostBlock& b : blocks) {
+        if (b.registered) {
+#ifndef _WIN32
+            (void) cudaHostUnregister(b.p);
+            munmap(b.p, (size_t) b.bytes);
+#endif
+        } else {
+            auto& ps = strata::core::pin_detail::st();
+            std::lock_guard<std::mutex> lk(ps.mu);
+            strata::core::pin_detail::free_locked(ps, b.p);
+        }
+        (void) cudaGetLastError();
+        freed += b.bytes;
+    }
+    g_kv_host_bytes = 0;
+    return freed;
+}
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);

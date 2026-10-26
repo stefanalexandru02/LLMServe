@@ -7,6 +7,8 @@
 // on a card (STRATA_EXCHANGE_ROTATE, STRATA_PCIE_BALANCE, STRATA_QSA_WARP, ...) are not in any table.
 //
 //   STRATA_SM86_PERF=0   turns the sm_86 table off (cards of compute capability 8.6: RTX 3050-3090, RTX A2000-A6000)
+//   STRATA_SM89_PERF=0   turns the sm_89 table off (Ada: RTX 4060-4090, RTX 6000 Ada, L4/L40); it is the sm_86 table, measured on one
+//                        RTX 4090 only (decode +7..31%, docs/BENCHMARKS.md), output identity not yet verified there
 //   STRATA_SM60_PERF=0   turns the sm_60 table off (Pascal GP100: Tesla P100)
 //
 // A switch the user set (to anything, including 0) is never overridden.  Applied once at start, before any engine code reads its

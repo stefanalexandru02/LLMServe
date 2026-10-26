@@ -29,6 +29,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/conversation_pool.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -5221,7 +5222,57 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
-        if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
+        uint64_t session_used = strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0);
+        // (streaming is in effect only when the resident cells are fewer than the context, as kv_plan decides)
+        const bool kv_streaming_asked = [&] {
+            if (o.kv_resident <= 0 || g.n_qsa_layers() <= 0) return false;
+            const int64_t ps = strata::core::qsa_shapes(g).page_size;
+            const int64_t pages = (o.max_context + ps - 1) / ps;
+            return (std::max<int64_t>(o.kv_resident, strata::core::qsa_kv_resident_min()) + ps - 1) / ps < pages;
+        }();
+        if (session_used == 0 && kv_streaming_asked) {
+            // KV streaming could not be set up: the pinned RAM for a layer's K/V host copy was refused (qsa_state_init says so).
+            // Everything else about the run is fine, so build the session again with the whole K/V in VRAM, as if --kv-resident
+            // had not been given, unless STRATA_KV_RESIDENT_STRICT=1.  Nothing is sized from the streamed session before this
+            // point on one GPU (the expert cache is sized after it, from the free VRAM), and qsa_set_kv_resident(0) makes every
+            // later session_bytes() / kv_plan() (the --batch slots, the drafter, the stages) plan the resident layout too.
+            const char* strict_env = std::getenv("STRATA_KV_RESIDENT_STRICT");
+            if (strict_env != nullptr && strict_env[0] == '1') {
+                std::fprintf(stderr, "strata generate: KV streaming (--kv-resident %lld) failed to start and "
+                                     "STRATA_KV_RESIDENT_STRICT=1 forbids the fallback\n", (long long) o.kv_resident);
+            } else {
+                const uint64_t pinned_before = strata::core::qsa_kv_host_bytes();
+                std::fprintf(stderr, "strata generate: WARNING: KV streaming (--kv-resident %lld) could not start: the pinned RAM "
+                                     "for the K/V host copy was refused (%.2f GiB pinned before the refusal).  Falling back to "
+                                     "the whole K/V in VRAM, as without --kv-resident (STRATA_KV_RESIDENT_STRICT=1 exits "
+                                     "instead)\n", (long long) o.kv_resident, (double) pinned_before / 1073741824.0);
+                strata::core::session_release(ss);   // the rope table registered by the half-built state points into sbuf
+                delete[] ss.qsa_states;
+                ss.qsa_states = nullptr;
+                cudaFree(sbuf);
+                sbuf = nullptr;
+                (void) cudaGetLastError();
+                const uint64_t unpinned = strata::core::qsa_kv_host_release();
+                o.kv_resident = 0;
+                strata::core::qsa_set_kv_resident(0);
+                const uint64_t resident_bytes = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr, "strata generate: KV streaming off: %.2f GiB of half-pinned host copies released; the session "
+                                     "now takes %.2f GiB of VRAM (%.2f GiB free)\n", (double) unpinned / 1073741824.0,
+                             (double) resident_bytes / 1073741824.0, (double) fb / 1073741824.0);
+                if (cudaMalloc(&sbuf, resident_bytes) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    sbuf = nullptr;
+                    std::fprintf(stderr, "strata generate: the session without KV streaming does not fit in VRAM either "
+                                         "(%.2f GiB needed, %.2f GiB free): lower --max-context or free RAM for the pinned copy\n",
+                                 (double) resident_bytes / 1073741824.0, (double) fb / 1073741824.0);
+                    return 1;
+                }
+                session_used = strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0);
+            }
+        }
+        if (session_used == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
@@ -9417,6 +9468,48 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // The conversation pool (strata/core/conversation_pool.hpp): parked conversations are copied into memory that stays
+        // resident between parks instead of being faulted in anew each time (first-touch allocation ran at ~100 MB/s inside a
+        // WSL2 VM: 2.2-2.5 s for one park, docs/BENCHMARKS.md).  STRATA_CONV_POOL=0 turns it off (plain heap segments as
+        // before); STRATA_CONV_PREFAULT_MIB=N makes the first N MiB resident on a background thread at start (default:
+        // min(cache budget, 1024), 0 = none).  Before the first buffer exists, i.e. before any park.
+        if (conversations.enabled()) {
+            const char* pool_env = std::getenv("STRATA_CONV_POOL");
+            if (pool_env != nullptr && pool_env[0] == '0') {
+                std::fprintf(stderr, "strata serve: conversation pool: off (STRATA_CONV_POOL=0); parked conversations use plain heap memory\n");
+            } else {
+                const uint64_t budget = (uint64_t) o.conversation_cache_mib << 20;
+                // the cache holds at most its budget, plus a snapshot being built beside it: a quarter more (at most 1 GiB) of address space
+                const uint64_t region = budget + std::min<uint64_t>(budget / 4, 1ull << 30);
+                int64_t pre_mib = std::min<int64_t>(o.conversation_cache_mib, 1024);
+                if (const char* e = std::getenv("STRATA_CONV_PREFAULT_MIB"); e != nullptr && e[0] != '\0') pre_mib = std::atoll(e);
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                const uint64_t margin = 512ull << 20;   // never fault in RAM the parking floor needs
+                const auto avail = strata::core::available_host_bytes();
+                const uint64_t room = avail && *avail > floor + margin ? *avail - floor - margin : 0;
+                const uint64_t want = (uint64_t) std::max<int64_t>(pre_mib, 0) << 20;
+                const uint64_t prefault = std::min(std::min(want, room), region);
+                const bool ok = strata::core::ConversationPool::init(
+                    (size_t) region, (size_t) prefault,
+                    [floor, margin] {   // asked every 64 MiB: stop when the host runs short of RAM
+                        const auto a = strata::core::available_host_bytes();
+                        return a && *a > floor + margin;
+                    },
+                    [](uint64_t bytes, double secs, bool completed) {
+                        std::fprintf(stderr, "strata serve: conversation pool: pre-faulted %llu MiB in %.2f s (%.0f MB/s)%s\n",
+                                     (unsigned long long) (bytes >> 20), secs, secs > 0 ? (double) bytes / 1e6 / secs : 0.0,
+                                     completed ? "" : " (stopped early: RAM short or the pool was shut down)");
+                    });
+                if (ok)
+                    std::fprintf(stderr, "strata serve: conversation pool: %llu MiB of address space reserved for parked conversations "
+                                         "(256 KiB slots); %s (STRATA_CONV_PREFAULT_MIB sets the pre-fault, 0 = none; STRATA_CONV_POOL=0 turns the pool off)\n",
+                                 (unsigned long long) (region >> 20),
+                                 prefault ? ("pre-faulting " + std::to_string(prefault >> 20) + " MiB in the background").c_str()
+                                          : "no pre-fault (pages are faulted in at the first park, then kept)");
+                else
+                    std::fprintf(stderr, "strata serve: conversation pool: not available on this system; parked conversations use plain heap memory\n");
+            }
+        }
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -9598,9 +9691,12 @@ int main(int argc, char** argv) {
                 // though every parked conversation could give its RAM back - and refusing here throws
                 // away the whole prompt read that produced this snapshot (measured: 270k tokens, 96 s).
                 // Evict the least recently active parked conversations until it fits, or until none are
-                // left.  Each ConversationBuffer is a list of 16 MiB segments, each segment its own
-                // allocation, so an evicted entry is back with the kernel before the next check reads
-                // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
+                // left.  Each ConversationBuffer is a list of segments of at most 16 MiB.  With the conversation
+                // pool off each is its own heap allocation, so an evicted entry is back with the kernel before the
+                // next check reads /proc/meminfo; with it on (the default) the memory goes back to the pool and
+                // stays resident, so MemAvailable does not move - conversation_memory_admit() credits the pool's
+                // free resident bytes against the allocation instead (conversation_pool.hpp).  No waiting is
+                // needed either way.  slots() bounds the loop, and the two lines
                 // below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
                 // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
                 size_t evicted = 0;
@@ -9619,6 +9715,9 @@ int main(int argc, char** argv) {
                                  evicted, conversations.size());
                     return true;
                 }
+                // memory the pool already holds resident is not new RAM: if it covers the whole snapshot the process does not grow, so
+                // the floor check after the capture (which reads MemAvailable) has nothing of ours to judge
+                const bool pool_covered = strata::core::ConversationPool::enabled() && strata::core::conversation_pool_credit() >= additional;
                 if (evicted)
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
@@ -9639,7 +9738,7 @@ int main(int argc, char** argv) {
                     image.stage_images.push_back(std::move(part));
                 }
                 const auto mem_after = strata::core::sample_host_memory();
-                if (!strata::core::conversation_memory_admit(
+                if (!pool_covered && !strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
@@ -9651,6 +9750,15 @@ int main(int argc, char** argv) {
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                if (strata::core::ConversationPool::enabled()) {
+                    const auto ps = strata::core::ConversationPool::stats();
+                    std::fprintf(stderr, "strata serve: conversation pool: %llu MiB in use, %llu MiB free and resident, %llu MiB cold of %llu MiB; "
+                                         "%llu segments from the pool, %llu from the heap, %llu trims; pre-fault %s\n",
+                                 (unsigned long long) (ps.used_bytes >> 20), (unsigned long long) (ps.free_resident_bytes >> 20),
+                                 (unsigned long long) (ps.free_cold_bytes >> 20), (unsigned long long) (ps.region_bytes >> 20),
+                                 (unsigned long long) ps.hits, (unsigned long long) ps.misses, (unsigned long long) ps.trims,
+                                 ps.prefault_running ? "still running" : "done");
+                }
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.

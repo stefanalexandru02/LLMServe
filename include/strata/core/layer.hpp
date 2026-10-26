@@ -306,6 +306,9 @@ int64_t qsa_kv_resident();
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
+/// Unpins and frees every KV host copy allocated so far; returns the bytes.  For the fallback when a session that streams its
+/// K/V could not be built (some layers got their copy, one did not): call it only once nothing refers to those states.
+uint64_t qsa_kv_host_release();
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);

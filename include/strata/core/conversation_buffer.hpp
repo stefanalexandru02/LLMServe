@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/core/conversation_pool.hpp"
 #include "strata/core/progress.hpp"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -53,8 +55,8 @@ public:
         const size_t extra = n - size_ - std::min(n - size_, spare);
         const size_t full = extra / segment_bytes, tail = extra % segment_bytes;
         if (!add(total, full * segment_bytes)) return SIZE_MAX;
-        if (tail && !add(total, segment_capacity(tail, full ? segment_bytes :
-                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0, size_))) return SIZE_MAX;
+        if (tail && !add(total, ConversationPool::round(segment_capacity(tail, full ? segment_bytes :
+                segments_.empty() ? 0 : segments_.back().capacity(), size_ != 0, size_)))) return SIZE_MAX;
         size_t count = segments_.size();
         if (!add(count, full + (tail != 0))) return SIZE_MAX;
         if (count > segments_.capacity() &&
@@ -123,7 +125,58 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    // One contiguous block: a std::vector<uint8_t> that takes its memory from the conversation pool when that is on
+    // (conversation_pool.hpp) and from operator new, exactly as a vector does, when it is not.  capacity() is what the
+    // block really holds (the pool rounds up to whole slots), so bytes() and the admission estimates stay true.
+    class Segment {
+    public:
+        Segment() = default;
+        Segment(const Segment& o) {
+            if (o.size_) { reserve(o.size_); std::memcpy(p_, o.p_, o.size_); size_ = o.size_; }
+        }
+        Segment& operator=(const Segment& o) {
+            if (this != &o) { Segment copy(o); swap(copy); }
+            return *this;
+        }
+        Segment(Segment&& o) noexcept
+            : p_(std::exchange(o.p_, nullptr)), size_(std::exchange(o.size_, 0)), cap_(std::exchange(o.cap_, 0)) {}
+        Segment& operator=(Segment&& o) noexcept {
+            if (this != &o) {
+                drop();
+                p_ = std::exchange(o.p_, nullptr);
+                size_ = std::exchange(o.size_, 0);
+                cap_ = std::exchange(o.cap_, 0);
+            }
+            return *this;
+        }
+        ~Segment() { drop(); }
+        size_t size() const { return size_; }
+        size_t capacity() const { return cap_; }
+        uint8_t* data() { return p_; }
+        const uint8_t* data() const { return p_; }
+        void reserve(size_t n) { if (n > cap_) grow(n); }
+        void resize(size_t n, uint8_t value = 0) {
+            if (n > cap_) grow(n);
+            if (n > size_) std::memset(p_ + size_, value, n - size_);
+            size_ = n;
+        }
+    private:
+        void swap(Segment& o) noexcept { std::swap(p_, o.p_); std::swap(size_, o.size_); std::swap(cap_, o.cap_); }
+        void drop() noexcept {
+            ConversationPool::release(p_, cap_, size_);
+            p_ = nullptr; size_ = 0; cap_ = 0;
+        }
+        void grow(size_t n) {   // n > cap_; the contents (size_ bytes) move over
+            const size_t cap = ConversationPool::round(n);
+            uint8_t* q = static_cast<uint8_t*>(ConversationPool::allocate(cap));
+            if (size_) std::memcpy(q, p_, size_);
+            ConversationPool::release(p_, cap_, size_);
+            p_ = q;
+            cap_ = cap;
+        }
+        uint8_t* p_ = nullptr;
+        size_t size_ = 0, cap_ = 0;
+    };
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.
