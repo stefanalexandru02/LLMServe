@@ -1,7 +1,5 @@
 #pragma once
 
-#include "strata/core/conversation_pool.hpp"
-
 #include <cstdint>
 #include <istream>
 #include <optional>
@@ -81,18 +79,8 @@ inline int64_t auto_conversation_cache_mib(std::optional<uint64_t> available, in
 
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
-// `allocation` is what the caller is about to allocate as conversation buffers.  The conversation pool (conversation_pool.hpp)
-// keeps the pages of freed segments resident, so MemAvailable does not count them although the next segments take them
-// without growing the process: that credit is taken off the allocation first (and an allocation the credit covers whole needs
-// no free RAM at all, since nothing new is requested from the OS).  A caller that asks about 0 bytes (is the floor still
-// held?) and the unknown size UINT64_MAX are judged on MemAvailable alone, as before.  Pool off: credit 0, the old rule.
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
-    if (allocation != 0 && allocation != UINT64_MAX) {
-        const uint64_t credit = conversation_pool_credit();
-        allocation -= credit < allocation ? credit : allocation;
-        if (allocation == 0) return true;
-    }
     return available && *available >= floor && allocation <= *available - floor;
 }
 

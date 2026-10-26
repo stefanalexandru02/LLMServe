@@ -46,7 +46,6 @@
 #include <sys/mman.h>
 #endif
 #include <memory>
-#include <mutex>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -584,22 +583,20 @@ uint64_t g_kv_host_bytes = 0;
 // is refused. STRATA_KV_HOST_REGISTER=1/0 forces registering first or cudaHostAlloc first. Like the cudaHostAlloc
 // copy it lives as long as the process.
 //
-// Every copy is recorded, so that `qsa_kv_host_release` can give them all back when a session that streams its K/V cannot be
-// built (generate.cpp then retries with the whole K/V in VRAM): without it the copies of the layers that did get theirs
-// would stay pinned for the life of the process.
+// Each copy is handed back to its caller as a `KvHostBlock`, which the owning QsaState records (kv_host_*), so that
+// `qsa_state_release_host` can give back exactly the copy of the state being torn down, and nothing else: when a session
+// that streams its K/V cannot be built, generate.cpp releases the half-built states and retries with the whole K/V in VRAM,
+// and the copies of the layers that did get theirs would otherwise stay pinned for the life of the process.
 struct KvHostBlock {
-    void* p;
-    uint64_t bytes;
-    bool registered;   // mmap + cudaHostRegister (else cudaHostAlloc)
+    void* p = nullptr;
+    uint64_t bytes = 0;
+    bool registered = false;   // mmap + cudaHostRegister (else cudaHostAlloc)
 };
-std::mutex g_kv_host_mu;
-std::vector<KvHostBlock> g_kv_host_blocks;
-uint8_t* kv_host_alloc(uint64_t bytes) {
-    auto host_alloc = [](uint64_t n) -> uint8_t* {
+uint8_t* kv_host_alloc(uint64_t bytes, KvHostBlock& blk) {
+    auto host_alloc = [&blk](uint64_t n) -> uint8_t* {
         uint8_t* h = nullptr;
         if (strata::core::host_alloc_guarded((void**) &h, n, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-            std::lock_guard<std::mutex> lk(g_kv_host_mu);
-            g_kv_host_blocks.push_back({h, n, false});
+            blk = KvHostBlock{h, n, false};
             return h;
         }
         (void) cudaGetLastError();
@@ -613,7 +610,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
         if (e != nullptr && (e[0] == '0' || e[0] == '1')) return e[0] == '1';
         return std::filesystem::exists("/dev/dxg");
     }();
-    auto register_anon = [](uint64_t n) -> uint8_t* {
+    auto register_anon = [&blk](uint64_t n) -> uint8_t* {
         void* m = mmap(nullptr, (size_t) n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) return nullptr;
         if (cudaHostRegister(m, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
@@ -626,10 +623,7 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
             std::fprintf(stderr, "strata: KV streaming: the host copy is pinned with cudaHostRegister\n");
             said = true;
         }
-        {
-            std::lock_guard<std::mutex> lk(g_kv_host_mu);
-            g_kv_host_blocks.push_back({m, n, true});
-        }
+        blk = KvHostBlock{m, n, true};
         return (uint8_t*) m;
     };
     if (register_first) {
@@ -790,28 +784,37 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
-uint64_t qsa_kv_host_release() {
-    std::vector<KvHostBlock> blocks;
-    {
-        std::lock_guard<std::mutex> lk(g_kv_host_mu);
-        blocks.swap(g_kv_host_blocks);
-    }
+uint64_t qsa_state_release_host(QsaState& st) {
     uint64_t freed = 0;
-    for (const KvHostBlock& b : blocks) {
-        if (b.registered) {
+    if (st.kv_host_p != nullptr) {
+        if (st.kv_host_registered) {
 #ifndef _WIN32
-            (void) cudaHostUnregister(b.p);
-            munmap(b.p, (size_t) b.bytes);
+            (void) cudaHostUnregister(st.kv_host_p);
+            munmap(st.kv_host_p, (size_t) st.kv_host_bytes);
 #endif
         } else {
             auto& ps = strata::core::pin_detail::st();
             std::lock_guard<std::mutex> lk(ps.mu);
-            strata::core::pin_detail::free_locked(ps, b.p);
+            strata::core::pin_detail::free_locked(ps, st.kv_host_p);
         }
         (void) cudaGetLastError();
-        freed += b.bytes;
+        freed = st.kv_host_bytes;
+        g_kv_host_bytes -= std::min(g_kv_host_bytes, freed);
+        st.kv_host_p = nullptr;
+        st.kv_host_bytes = 0;
+        st.kv_host_registered = false;
+        st.host = strata::kernels::KvHostPools{};   // pointers into the copy
     }
-    g_kv_host_bytes = 0;
+    // the pinned step/position staging (cudaHostAlloc through host_alloc_guarded)
+    if (st.host_step != nullptr || st.host_pos != nullptr) {
+        auto& ps = strata::core::pin_detail::st();
+        std::lock_guard<std::mutex> lk(ps.mu);
+        strata::core::pin_detail::free_locked(ps, st.host_step);
+        strata::core::pin_detail::free_locked(ps, st.host_pos);
+        (void) cudaGetLastError();
+        st.host_step = nullptr;
+        st.host_pos = nullptr;
+    }
     return freed;
 }
 
@@ -840,6 +843,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
+    st.init_failure = QsaInitFailure::None;
+    // a failure after the pinned staging exists gives it (and the K/V host copy, if it got that far) back: a half-built
+    // state is never used, and its pinned memory would otherwise stay charged to the process
+    auto fail = [&st](QsaInitFailure why) -> uint64_t {
+        (void) qsa_state_release_host(st);
+        st.init_failure = why;
+        return 0;
+    };
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
     st.kv_q4 = g_kv_q4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
@@ -876,7 +887,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         pool->page_size = s.page_size;
         if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
             std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
-            return 0;
+            return fail(QsaInitFailure::Other);
         }
         uint8_t* b = pool->range.base();
         const uint64_t* o = pool->off.data();
@@ -937,11 +948,23 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-    if (strata::core::host_alloc_guarded((void**) &st.host_step, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
-                      cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-        strata::core::host_alloc_guarded((void**) &st.host_pos, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) !=
-            cudaSuccess) {
-        return 0;   // the caller sees a zero byte count; a half-built state is worse than none
+    st.host_step = nullptr;
+    st.host_pos = nullptr;
+    {
+        void* hs = nullptr;
+        void* hp = nullptr;
+        bool staged = strata::core::host_alloc_guarded(&hs, strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+                                                       cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+        if (staged) {
+            st.host_step = (int32_t*) hs;   // recorded at once, so that a failure below gives it back
+            staged = strata::core::host_alloc_guarded(&hp, (size_t) s.n_head * 4, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+            if (staged) st.host_pos = (int32_t*) hp;
+        }
+        if (!staged) {
+            std::fprintf(stderr, "strata: QSA layer state: the pinned step/position staging buffers were refused "
+                                 "(not the KV host copy)\n");
+            return fail(QsaInitFailure::Other);   // the caller sees a zero byte count; a half-built state is worse than none
+        }
     }
     st.host_step[strata::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
@@ -951,16 +974,26 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if ((h = kv_host_alloc(bytes)) == nullptr ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
-            // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
+        KvHostBlock blk;
+        if ((h = kv_host_alloc(bytes, blk)) == nullptr) {
+            // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM.  This is the
+            // one failure generate.cpp answers by rebuilding the session without KV streaming (QsaInitFailure::KvHostCopy).
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
                                  "or run without --kv-resident\n", (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);
-            return 0;
+            return fail(QsaInitFailure::KvHostCopy);
         }
+        st.kv_host_p = blk.p;
+        st.kv_host_bytes = blk.bytes;
+        st.kv_host_registered = blk.registered;
         g_kv_host_bytes += bytes;
+        if (const cudaError_t e = cudaHostGetDevicePointer((void**) &d, h, 0); e != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata: KV streaming: cudaHostGetDevicePointer on a layer's KV host copy failed: %s\n",
+                         cudaGetErrorString(e));
+            return fail(QsaInitFailure::Other);   // releases the copy just recorded, and the staging
+        }
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);

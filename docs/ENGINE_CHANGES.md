@@ -4,9 +4,12 @@ Changes to the engine itself (`src/`, `include/`, `CMakeLists.txt`), made for an
 Each entry says why (with the measurement), how to turn it off, and what to look for in the engine log
 (`docker exec llmserve grep -E "<pattern>" /data/logs/engine.log`).
 
-Status: all four compile cleanly (CUDA 13.0.2, `-DCMAKE_CUDA_ARCHITECTURES=89-real`, 8 min 42 s at `-j4`, no new warnings) and
-`strata --help` starts. None of it has run on a GPU yet. The one piece that can run without a GPU, the conversation pool,
-has a host test (see 2). Everything below that says "expected" is expected, not measured.
+Status: both pieces that remain (sections 1 and 3) compile cleanly (CUDA 13.0.2, `-DCMAKE_CUDA_ARCHITECTURES=89-real`; details in
+section 4) and `strata --help` starts. Neither has run on a GPU yet. Everything below that says "expected" is expected, not
+measured.
+
+An earlier version of this change also added a resident conversation-cache segment pool; it was removed after review, see
+section 2.
 
 ## 1. sm_89 (Ada) default speed set
 
@@ -45,76 +48,54 @@ The number is lower than 9 for each of the nine you set yourself. The line is ab
 cards (sm_86 prints `sm_86 (Ampere)`, sm_60 `sm_60 (Pascal)`; the old code printed "sm_86" for every compute capability 8.x).
 Also the engine log says these switches turn off "adaptive overlap"; that is `STRATA_ADAPT_NOWAIT/ADAPT_LAG`, and is what was measured.
 
-## 2. Conversation cache: no first-touch allocation on the request path
+## 2. Conversation cache segment pool: removed
 
-**What.** Parked conversations are copied into `ConversationBuffer` segments (<= 16 MiB). Before, each segment was its own heap
-allocation, freed to the kernel on eviction, so every park faulted fresh pages in. Now (Linux):
+An earlier version of this change replaced the heap segments of the conversation cache (`ConversationBuffer`) with slots of one
+`mmap`'d region whose freed pages stayed resident, pre-faulted in the background, to remove the 2.2-2.5 s first-touch cost of the
+first parks under WSL2. A code review found OOM risks in its RAM admission accounting, so **the pool was removed entirely** and
+conversation buffers and RAM admission are exactly as before it (`conversation_buffer.hpp`, `conversation_memory.hpp`,
+`CMakeLists.txt` and the conversation-cache code in `generate.cpp` are identical to the commit before the pool; its sources and
+the `STRATA_CONV_POOL` / `STRATA_CONV_PREFAULT_MIB` settings are gone). The problem, in short: admission subtracted the pool's free
+resident bytes from every allocation, but
 
-- `include/strata/core/conversation_pool.hpp`, `src/core/conversation_pool.cpp`: one `mmap`'d region of address space
-  (cache budget + 25%, at most +1 GiB, untouched pages cost nothing) cut into 256 KiB slots. A segment of >= 1 MiB takes a run of
-  slots (a fully resident run preferred); a freed segment gives its slots back *with the pages still resident*. Segments below
-  1 MiB, and any segment the region cannot serve, are plain heap allocations as before.
-- A background thread (`conv-prefault`, `SCHED_IDLE` + nice 19, 1 MiB at a time, 0.3 ms apart, `MADV_POPULATE_WRITE` with a
-  write-zeros fallback) makes the first K MiB resident at start. It claims only free slots, so a park never waits for it. It
-  stops by itself if available RAM falls under the parking floor + 512 MiB.
-- `ConversationBuffer` (`conversation_buffer.hpp`) holds its segments as a small block type instead of `std::vector<uint8_t>`;
-  with the pool off it is `operator new`/`delete` of exactly the requested capacity, as the vector was.
-- **RAM admission stays correct.** Evicting a parked conversation now returns RAM to the pool, not to `MemAvailable`, so
-  `conversation_memory_admit()` (`conversation_memory.hpp`) first subtracts the pool's free *resident* bytes from the
-  allocation and judges only the remainder against `MemAvailable - floor`; an allocation the pool covers whole needs no free
-  RAM. Capacities are rounded up to 256 KiB while the pool is on, and the admission estimate (`allocation_peak`) rounds the
-  same way. When a request finds no run (full or fragmented) the pool first hands *all* its idle resident slots back to the
-  kernel (`madvise(MADV_DONTNEED)`) and then allocates from the heap, so the process never grows by more than the admission
-  assumed (growth <= allocation - credit). The "RAM floor after capture" check is skipped only when the pool covered the
-  whole snapshot (nothing of ours was requested from the OS).
-- Cost: the pool keeps its high-water mark of conversation memory (up to the cache budget, which the cache could hold anyway)
-  resident instead of returning it to the VM after each eviction. The default pre-fault is `min(budget, 1024)` MiB.
+- the pool could serve a request from cold slots while the credited resident holes stayed resident and stayed credited, so the
+  process grew by the whole allocation although admission assumed it would not;
+- a large part of every park and of every session save/read (the GDN/PLE running state and checkpoint copies, segments under
+  1 MiB, the save's write buffer) is plain heap memory the pool never serves, yet the credit was applied to it too;
+- when the credit covered the request, admission returned true with no `MemAvailable` check, and the "RAM floor after capture"
+  check was skipped as well, also on a reuse-park that needed no new K/V at all;
+- evicted K/V went back to the pool and not to the kernel, so the eviction loops could no longer raise `MemAvailable`.
 
-**Why.** BENCHMARKS.md ("where the short-prompt TTFT goes"): parking the previous conversation took 2.2-2.5 s for ~240 MB while
-the cache's 4 places were first being filled (first-touch allocation in the WSL2 VM at ~100 MB/s) and 34-207 ms once it reused
-memory. It is counted in the next request's prompt time, ~2 s of a ~2.8 s short-prompt TTFT.
-
-**Settings.**
-
-| | |
-|---|---|
-| `STRATA_CONV_POOL=0` | pool off: plain heap segments, behaviour as before this change |
-| `STRATA_CONV_PREFAULT_MIB=N` | pre-fault N MiB in the background at start (default `min(cache budget, 1024)`; `0` = none, pages are then faulted at the first park and kept) |
-
-**Look for.**
-
-```
-strata serve: conversation pool: 5120 MiB of address space reserved for parked conversations (256 KiB slots); pre-faulting 1024 MiB in the background (...)
-strata serve: conversation pool: pre-faulted 1024 MiB in 1.8 s (570 MB/s)          <- seconds after start; at ~100 MB/s it takes ~10 s
-```
-
-and after each park (the existing `conversation cache: parked N tokens in X ms` line is unchanged), a pool line:
-
-```
-strata serve: conversation pool: 240 MiB in use, 780 MiB free and resident, ... ; 61 segments from the pool, 0 from the heap, 0 trims; pre-fault done
-```
-
-Expect the first park after start to be fast (tens to a few hundred ms instead of 2.2-2.5 s) as long as the pre-fault had finished and
-the snapshot fits in it. "from the heap" > 0 together with `no free run of N MiB ... heap instead` lines means the region was full or
-fragmented (the cache budget is smaller than what is being parked, or checkpoints/disk sessions hold segments too); the
-pool then hands its idle memory back, which is safe but gives up the benefit for that park. `conversation pool: off` or
-`not available on this system` means the plain path is in use.
-
-**Tested** (no GPU): `src/core/conversation_pool_test.cpp`, standalone, not in CMake:
-`g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -Iinclude src/core/conversation_pool_test.cpp src/core/conversation_pool.cpp -pthread && ./a.out`.
-It covers: pool-off capacities equal the estimate; pre-fault accounting; admission credit; content integrity through resize,
-shrink, copy and move; region exhaustion; the fragmentation trim; 6 threads allocating and freeing; and that a second park
-takes no new RSS while a trim returns it (cold 74 ms vs warm 51 ms for 48 MiB on this sandbox, where faults are cheap; the VM
-case is the 100 MB/s one).
+**What addresses the first-park cost instead.** The start-up warm-up now parks a few short conversations before the port opens
+(`LLMSERVE_WARMUP_PARKS`, default 4; [TTFT_WARMUP.md](TTFT_WARMUP.md)), which takes the first-touch faults of the heap segments
+at start-up instead of on a request's path. Like the pool's pre-fault this only helps while the freed memory has not been
+returned to the VM, which the plain heap does not guarantee; TTFT_WARMUP.md says what is estimated and what is measured.
 
 ## 3. `--kv-resident`: fall back instead of exiting when the pin is refused
 
 **What.** `src/program/generate.cpp` (session creation) and `src/core/layer.cpp`. With `--kv-resident N` the K/V host copy is pinned
 (`cudaHostRegister` under `/dev/dxg`, else `cudaHostAlloc`). If that is refused, `session_init` failed and the engine exited
-with `session_init failed`. Now, unless `STRATA_KV_RESIDENT_STRICT=1`, it logs why, releases the copies the earlier layers did
-get (`qsa_kv_host_release()`: they were never freed), the half-built session and its rope-table registration, sets
-`--kv-resident` to 0 for the rest of the run, and builds the session again with the whole K/V in VRAM, as if the flag had not
-been given. Streaming counts as requested only when the resident cells are fewer than the context (as `kv_plan` decides).
+with `session_init failed`. Now, unless `STRATA_KV_RESIDENT_STRICT=1`, it logs why, releases the pinned memory of the half-built
+session (below), its rope-table registration, sets `--kv-resident` to 0 for the rest of the run, and builds the session again
+with the whole K/V in VRAM, as if the flag had not been given.
+
+**When the fallback applies (narrowed after review).** Only when `qsa_state_init` reports `QsaInitFailure::KvHostCopy`
+(`layer.hpp`): `kv_host_alloc` was refused both ways (`cudaHostRegister` and `cudaHostAlloc`) for a layer that `kv_plan` really
+streams. That is decided in the layer, not guessed from `--kv-resident` in `generate.cpp`, so a context that fits in the resident
+cells, or `STRATA_KV_MAIN_OFF` (which makes `kv_plan` keep every layer resident), can never look like "streaming was asked". Any
+other `session_init` failure is `QsaInitFailure::Other`: the pinned `host_step`/`host_pos` staging refused,
+`cudaHostGetDevicePointer` on the host copy failed, or the elastic K/V could not be mapped. Without streaming it would fail the
+same way again, so the fallback is not tried: `qsa_state_init` names the real cause on stderr, `generate.cpp` prints
+`session_init failed (not a refusal to pin the K/V host copy ...; see the line above)` and exits as before.
+
+**What is released, and only that.** Each streamed `QsaState` records its own K/V host copy (`kv_host_p/bytes/registered`);
+`qsa_state_release_host(QsaState&)` gives back that state's copy (`cudaHostUnregister` + `munmap`, or `cudaFreeHost` through the
+pin budget) and its pinned `host_step`/`host_pos` staging, and touches nothing else. `qsa_state_init` calls it for its own state
+when it fails (so the failing layer leaks nothing), `session_release_pinned(SessionState&)` calls it for every state a session
+built, and the fallback uses that. The earlier version of this change kept a process-wide list of copies and freed all of them,
+which would have unmapped memory that other live states (a later stage, a `--batch` slot, the drafter) still use as soon as a
+second caller existed; the staging buffers of the half-built states were not freed at all. The drafter's own fallback in `mtp.cpp`
+(which calls `qsa_state_init` too) stops leaking its first attempt's staging for the same reason: the failed call releases it.
 
 **VRAM accounting.** The expert cache is sized after the session from `cudaMemGetInfo`, so it sees the larger resident session on
 the fallback path by itself. `qsa_set_kv_resident(0)` makes every later `session_bytes()` / `kv_plan()` (the `--batch` slots, the
@@ -137,12 +118,15 @@ strata generate: WARNING: KV streaming (--kv-resident 32768) could not start: th
 strata generate: KV streaming off: X GiB of half-pinned host copies released; the session now takes Y GiB of VRAM (Z GiB free)
 ```
 
-(no `KV streaming:` line follows, and the `INFO` line reports `kv_resident=0`). This also lets the config in SPEED_PLAN A2/B1 be
+(no `KV streaming:` line follows, and the `INFO` line reports `kv_resident=0`). An unrelated `session_init` failure instead
+prints its own cause (`the pinned step/position staging buffers were refused (not the KV host copy)`, or
+`cudaHostGetDevicePointer on a layer's KV host copy failed: ...`) followed by `session_init failed (not a refusal to pin the K/V
+host copy, so the --kv-resident fallback does not apply; ...)`. This also lets the config in SPEED_PLAN A2/B1 be
 tried on WSL2 without a risk of a start that does not come up.
 
 ## 4. Build
 
 `strata` and `strata_kq` build with the Dockerfile's recipe for `89-real` (CUDA 13.0.2, cmake 4.4.3, ninja 1.13.2,
-llama.cpp `3cf03257f2`): 164 steps, 8 min 42 s wall at `-j4` on 4 cores / 15 GB. The only warnings are the existing ones
-(`native_mmvq.cu`, `iq_kernels.cu`, `layer.cpp` misleading indentation / unused variables, `generate.cpp:12068`); none are in code
-these changes added. `src/core/conversation_pool.cpp` is a new line in the `strata_engine` source list in `CMakeLists.txt`.
+llama.cpp `3cf03257f2`): 163 steps, 7 min 27 s wall at `-j4` on 4 cores / 15 GB, and `strata --help` prints its usage in the CUDA
+container (no GPU there). The only warnings are the existing ones (`native_mmvq.cu`, `iq_kernels.cu`, `layer.cpp` misleading
+indentation / unused variables, `generate.cpp` unused `w`); none are in code these changes added or touched.

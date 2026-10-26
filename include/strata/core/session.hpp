@@ -60,6 +60,8 @@ struct SessionState {
     int64_t gdn_ord0 = 0;                 ///< global GDN ordinal of `gdn_state` row 0
     int64_t gdn_alloc = 0;                ///< allocated GDN rows
     int qsa_primary() const { return (int) qsa_ord0; }
+    /// Set by `session_init` when it returns 0: why the QSA state that failed did (QsaInitFailure::None otherwise).
+    QsaInitFailure init_failure = QsaInitFailure::None;
     /// The doorbell the host loop polls.  Null until a caller provides one - the engine runs without it, and
     /// neither `session_token` nor `session_replay` looks at it.
     const Doorbell* db = nullptr;
@@ -103,6 +105,10 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
+/// Gives back the pinned host memory the allocated QSA states hold (each one's step/position staging and K/V host copy;
+/// qsa_state_release_host) and returns the K/V copy bytes.  Only for a session that is being thrown away, like
+/// `session_release` (generate.cpp's --kv-resident fallback), after it and before `qsa_states` is deleted.
+uint64_t session_release_pinned(SessionState& s);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);

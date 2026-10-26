@@ -200,6 +200,11 @@ bool layer_shared_early();
 
 // ================================ the QSA mixer ================================
 
+/// Why qsa_state_init failed.  KvHostCopy: the pinned RAM for the K/V host copy of a streamed layer was refused (the only
+/// failure that running without --kv-resident cures); Other: anything else (the step/position staging was refused,
+/// cudaHostGetDevicePointer failed, the elastic K/V could not be mapped), already named on stderr by qsa_state_init.
+enum class QsaInitFailure : uint8_t { None = 0, Other, KvHostCopy };
+
 /// THE PERSISTENT STATE OF ONE QSA LAYER FOR ONE SEQUENCE: the KV cache, the indexer's pooled keys, the rope
 /// tables, and the per-token step buffer.  None of it is scratch - it survives every token.
 ///
@@ -271,6 +276,15 @@ struct QsaState {
     /// copy and give back the overlap the doorbell protocol exists for.
     int32_t* host_step = nullptr;    ///< (kStepCount + 1,) pinned; final element is attention status
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
+
+    /// The K/V host copy of a streamed state (`host` points into it), as kv_host_alloc made it; null when there is none.
+    /// qsa_state_release_host gives it back.
+    void* kv_host_p = nullptr;
+    uint64_t kv_host_bytes = 0;
+    bool kv_host_registered = false; ///< mmap + cudaHostRegister (else cudaHostAlloc)
+
+    /// Why the last qsa_state_init returned 0 (None after a success).
+    QsaInitFailure init_failure = QsaInitFailure::None;
 };
 
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
@@ -306,9 +320,11 @@ int64_t qsa_kv_resident();
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
-/// Unpins and frees every KV host copy allocated so far; returns the bytes.  For the fallback when a session that streams its
-/// K/V could not be built (some layers got their copy, one did not): call it only once nothing refers to those states.
-uint64_t qsa_kv_host_release();
+/// Gives back what ONE state holds in pinned host memory: its K/V host copy (kv_host_*) and its step/position staging
+/// (host_step, host_pos); returns the K/V copy's bytes.  Touches no other state's memory.  For the fallback when a session
+/// that streams its K/V could not be built (some layers got their copy, one did not): call it only once nothing refers to the
+/// state (no captured graph, no running kernel).  A failed qsa_state_init has already done it for its own state.
+uint64_t qsa_state_release_host(QsaState& st);
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);

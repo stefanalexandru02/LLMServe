@@ -113,10 +113,13 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
+    s.init_failure = QsaInitFailure::None;
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0) {
+            s.init_failure = s.qsa_states[s.qsa_ord0 + j].init_failure;
             return 0;
+        }
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));
@@ -136,6 +139,12 @@ void session_release(SessionState& s) {
             strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
         }
+}
+
+uint64_t session_release_pinned(SessionState& s) {
+    uint64_t freed = 0;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) freed += qsa_state_release_host(s.qsa_states[s.qsa_ord0 + j]);
+    return freed;
 }
 
 #if defined(STRATA_GPU_METAL)
