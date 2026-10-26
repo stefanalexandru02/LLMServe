@@ -68,7 +68,21 @@ VISION_GPU_MIN_VRAM_GB = 23.5         # "on" reads pictures on the GPU from 24 G
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700}, "cpu": {"max_tokens": 300, "reserve_mib": 0}}
 VISION_THREADS_CAP = 16
 PARALLEL_MAX = 8
-PARALLEL_SHARE, PARALLEL_HELD = 0.2, 0.5
+# parallel slots (an estimate, see parallel_recommend): the slots together may take PARALLEL_SHARE of the expert cache, and the
+# cache must hold at least PARALLEL_MIN_CACHE of the experts before any slot is carved out of it.
+PARALLEL_SHARE, PARALLEL_MIN_CACHE = 0.13, 0.40
+PARALLEL_REC_MAX = 4                  # --batch-mtp fits 4 slots in an 8-row verify window; more slots take turns
+# LLMSERVE_BATCH_SWITCHES (parallel >= 2): the engine's opt-in batch-window switches.  Every name is read by src/ (verify.cpp for
+# the first two, generate.cpp for the others).  STRATA_BATCH_ATTN_ROWS is left out with KV streaming (verify.cpp: no streamed KV).
+BATCH_SWITCH_ENV = {"STRATA_BATCH_GDN_GROUPS": "1", "STRATA_BATCH_ATTN_ROWS": "1", "STRATA_SLOT_COPY_DIRECT": "1",
+                    "STRATA_SLOT_COPY_BATCHSYNC": "1"}
+# LLMSERVE_AGENT: STRATA_CACHE_MESSAGE_BOUNDARY is read by the engine (generate.cpp), so it goes into the run config's "env".
+# STRATA_ADMIT_SHORT_FIRST is read by the Python server (serve/server.py) from ITS environment, which the run config does not
+# reach: docker/entrypoint.sh exports it when parallel >= 2.
+AGENT_ENGINE_ENV = {"STRATA_CACHE_MESSAGE_BOUNDARY": "1"}
+AGENT_ADMIT_SHORT_FIRST = 4096
+AGENT_CONVERSATION_CACHE_MIB = 4096
+CONVERSATION_CACHE_RAM_LEFT_GB = 4    # RAM beside the quant and the parked conversations: the OS, the server, the file cache
 SLOW_MOUNT_TYPES = {"9p", "drvfs", "virtiofs", "fuse.grpcfuse", "grpcfuse", "fakeowner", "cifs", "smb3", "smbfs",
                     "nfs", "nfs4", "fuse.osxfs", "fuse.sshfs"}
 OLD_DRAFT_VOCABS = {"369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25"}   # Strata <= 0.1.26
@@ -302,6 +316,10 @@ class Settings:
     hf_token_env: str = "HF_TOKEN"
     hf_endpoint: str = ""
     force: bool = False
+    batch_mtp: bool = False           # parallel >= 2: --batch-mtp (each slot also verifies one MTP proposal per window)
+    batch_switches: bool = False      # parallel >= 2: the STRATA_BATCH_* / STRATA_SLOT_COPY_* switches (BATCH_SWITCH_ENV)
+    agent: bool = False               # agent-friendly defaults (message-boundary cache, short-first admission, parked chats)
+    conversation_cache_mib: int | None = None   # --conversation-cache-mib (default: the engine's own sizing, or 4096 with agent)
 
     def __post_init__(self):
         self.data_dir = Path(self.data_dir)
@@ -316,7 +334,9 @@ class Settings:
                 "resident_budget_gib": self.resident_budget_gib, "vram_reserve_mib": self.vram_reserve_mib,
                 "rope_scaling": self.rope_scaling, "rope_scale": self.rope_scale, "gpu": self.gpu,
                 "port": self.port, "extra_args": list(self.extra_args), "engine_env": dict(self.engine_env),
-                "engine_dir": str(self.engine_dir), "data_dir": str(self.data_dir)}
+                "engine_dir": str(self.engine_dir), "data_dir": str(self.data_dir),
+                "batch_mtp": self.batch_mtp, "batch_switches": self.batch_switches, "agent": self.agent,
+                "conversation_cache_mib": self.conversation_cache_mib}
 
 
 def parse_context(value: int | str) -> int | str:
@@ -425,12 +445,28 @@ def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
 
 
+def parallel_cache_gb(vram_gb: float) -> float:
+    """About how much VRAM the expert cache gets: the card less ~5 GB (dense weights, buffers, a 32K context)."""
+    return max(0.0, vram_gb - 5)
+
+
 def parallel_recommend(vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool) -> int:
-    cache_gb = max(0.0, vram_gb - 5)
+    """The most slots (2-4) worth running on this card, 0 when none.  An ESTIMATE, from two rules:
+
+    1. the expert cache (VRAM less ~5 GB) must hold at least PARALLEL_MIN_CACHE (40%) of the experts: a card that already holds
+       less loses much more per slot (docs/BATCHING.md: 10-25% per request on a 12 GB card), so no recommendation;
+    2. all slots together take at most PARALLEL_SHARE (13%) of that cache.
+
+    Rule 2 compares with the cache, not with a fixed number of GB left over, so a card that reports 23.99 GiB instead of 24 does not
+    flip the answer.  Q2_0 on a 24 GB card (cache ~19 GB, 34 GB of experts): 2 slots at 64K (1.0 GB each), 3 at 48K, 4 at 32K;
+    3 at 64K or 2 at 128K (1.8 GB each) are not recommended.  With KV streaming a slot keeps at most 32K of KV in VRAM."""
+    cache_gb = parallel_cache_gb(vram_gb)
+    if cache_gb < PARALLEL_MIN_CACHE * arena_gb:
+        return 0
     slot = parallel_slot_gb(ctx, kv, streaming)
     best = 0
-    for n in (2, 3, 4):
-        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb:
+    for n in range(2, PARALLEL_REC_MAX + 1):
+        if n * slot <= PARALLEL_SHARE * cache_gb:
             best = n
     return best
 
@@ -695,26 +731,79 @@ def build_plan(s: Settings, hw: Hardware, *, ple_gb: float | None = None, files_
         info_(f"tip for a {hw.vram_gib:.0f} GB card: LLMSERVE_DRAFT_VOCAB=en uses ~215 MiB less VRAM for the draft "
               "head (English and code answers); it is the fix when the start says \"the draft head does not fit\"")
 
+    # ---- parallel requests (cfg "parallel": the server adds --batch N)
+    parallel = s.parallel
+    if parallel is not None and parallel > PARALLEL_MAX:
+        warn_(f"the engine runs at most {PARALLEL_MAX} requests at once; --parallel {parallel} becomes {PARALLEL_MAX}")
+        parallel = PARALLEL_MAX
+    batching = bool(parallel and parallel >= 2)
+
+    # ---- settings that add engine arguments / engine environment (the person's --extra-args / --engine-env win over them)
+    gen_env: dict = {}
+    if s.batch_mtp:
+        if not batching:
+            info_("LLMSERVE_BATCH_MTP=on does nothing with LLMSERVE_PARALLEL=1: it needs two or more slots")
+        elif not s.mtp:
+            warn_("LLMSERVE_BATCH_MTP=on needs the draft layer (LLMSERVE_MTP=on); --batch-mtp left out")
+        else:
+            args += ["--batch-mtp"]
+            if parallel > 4:
+                info_(f"batch MTP: a window holds 8 rows, 2 per slot, so {parallel} slots take turns (4 at a time)")
+            ok_("batch MTP: every slot also verifies one draft proposal per window (--batch-mtp). If the start log says "
+                "\"MTP admission ... failed\", set LLMSERVE_BATCH_MTP=off")
+    cache_mib = s.conversation_cache_mib
+    if s.agent and cache_mib is None:
+        room_mib = int((ram - q.ram_gb - CONVERSATION_CACHE_RAM_LEFT_GB) * 1024)
+        cache_mib = min(AGENT_CONVERSATION_CACHE_MIB, room_mib)
+        if cache_mib < 1024:
+            warn_(f"agent mode: only ~{max(room_mib, 0) // 1024} GiB of RAM is left beside {q.name} ({ram:.0f} GiB, it asks "
+                  f"{q.ram_gb}); conversation parking is left to the engine's own sizing")
+            cache_mib = None
+    if cache_mib is not None:
+        args += ["--conversation-cache-mib", str(cache_mib)]
+        ok_(f"parked conversations: up to {cache_mib} MiB of RAM (--conversation-cache-mib)"
+            + ("" if s.conversation_cache_mib is not None else " (agent mode)"))
+    if s.agent:
+        gen_env.update(AGENT_ENGINE_ENV)
+        ok_("agent mode: prompt snapshot at the message boundary (STRATA_CACHE_MESSAGE_BOUNDARY=1)"
+            + (f"; short prompts are admitted first (STRATA_ADMIT_SHORT_FIRST={AGENT_ADMIT_SHORT_FIRST}, exported by the "
+               "container entry point for the server)" if batching else ""))
+
     # ---- --extra-args on top (their value wins for the same flag)
     user = list(s.extra_args)
     if user:
         args = merge_args(args, user)
         ok_("extra engine arguments: " + shlex.join(user))
 
-    # ---- parallel requests (cfg "parallel": the server adds --batch N)
-    parallel = s.parallel
-    if parallel is not None and parallel > PARALLEL_MAX:
-        warn_(f"the engine runs at most {PARALLEL_MAX} requests at once; --parallel {parallel} becomes {PARALLEL_MAX}")
-        parallel = PARALLEL_MAX
-    if parallel and parallel >= 2:
+    if s.batch_switches:
+        if not batching:
+            info_("LLMSERVE_BATCH_SWITCHES=on does nothing with LLMSERVE_PARALLEL=1: it needs two or more slots")
+        else:
+            sw = dict(BATCH_SWITCH_ENV)
+            if "--kv-resident" in args:                   # a streamed KV cache: one launch per row stays (verify.cpp)
+                del sw["STRATA_BATCH_ATTN_ROWS"]
+                info_("batch switches: STRATA_BATCH_ATTN_ROWS left out (the KV cache is streamed, --kv-resident)")
+            gen_env.update(sw)
+            ok_("batch switches: " + " ".join(f"{k}={v}" for k, v in sw.items()))
+
+    if batching:
         rec = parallel_recommend(vram, q.arena_gb, ctx, kv, streaming)
         slot = parallel_slot_gb(ctx, kv, streaming)
-        ok_(f"parallel requests: {parallel} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache)")
+        cache = parallel_cache_gb(vram)
+        share = f" = ~{100 * slot / cache:.0f}% of the ~{cache:.0f} GB expert cache" if cache > 0 else ""
+        ok_(f"parallel requests: {parallel} at once (estimate: each takes ~{slot:.1f} GB of VRAM{share}; "
+            "the engine log prints the exact size)")
         if not rec:
-            warn_("parallel > 1 costs about 10-25% speed per request on a card that holds only part of the experts "
-                  "(docs/BATCHING.md in Strata); kept as you chose")
+            if cache < PARALLEL_MIN_CACHE * q.arena_gb:
+                warn_("parallel > 1 costs about 10-25% speed per request on a card that holds only part of the experts "
+                      "(estimate, docs/BATCHING.md); kept as you chose")
+            else:
+                warn_(f"estimate: {parallel} slots at this context would take ~{100 * parallel * slot / cache:.0f}% of the expert "
+                      f"cache, more than the {100 * PARALLEL_SHARE:.0f}% LLMServe recommends; on a card this size each slot "
+                      "costs roughly 5% of the single-request speed. Kept as you chose; a shorter context makes slots cheaper")
         elif parallel > rec:
-            warn_(f"recommended for this card: {rec}; more slots leave fewer experts in VRAM; kept as you chose")
+            warn_(f"recommended for this card at this context: {rec} (estimate: more slots take over "
+                  f"{100 * PARALLEL_SHARE:.0f}% of the expert cache); kept as you chose")
 
     # ---- disk
     shard_gb = sum(f.size for f in C.shard_files(q)) / 1e9
@@ -736,7 +825,7 @@ def build_plan(s: Settings, hw: Hardware, *, ple_gb: float | None = None, files_
     cfg: dict = {"exe": str(s.engine_dir / "strata"), "args": args, "cwd": str(data),
                  "tokenizer": str(pack / "tokenizer"), "model_name": f"{fam.model_name}-{q.name.lower()}",
                  "log": str(data / "logs" / "engine.log"), "lib_dirs": lib_dirs, "port": s.port}
-    env = {**unsloth_env(q, in_budget), **s.engine_env}
+    env = {**unsloth_env(q, in_budget), **gen_env, **s.engine_env}
     if env:
         cfg["env"] = env
     if hw.gpu_count > 1 or s.gpu is not None:
@@ -1337,6 +1426,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--kv", default=e("LLMSERVE_KV", "int8"), choices=KV_CHOICES, help="KV cache format")
     ap.add_argument("--kv-streaming", default=e("LLMSERVE_KV_STREAMING", "auto"), choices=("auto", "on", "off"))
     ap.add_argument("--mtp", default=e("LLMSERVE_MTP", "on"), choices=("on", "off"), help="draft layer (speculative decoding)")
+    ap.add_argument("--batch-mtp", default=e("LLMSERVE_BATCH_MTP", "off"), choices=("on", "off"),
+                    help="with --parallel >= 2: every slot also verifies one draft proposal per window (--batch-mtp)")
+    ap.add_argument("--batch-switches", default=e("LLMSERVE_BATCH_SWITCHES", "off"), choices=("on", "off"),
+                    help="with --parallel >= 2: the engine's opt-in batch-window switches (" + " ".join(BATCH_SWITCH_ENV) + ")")
+    ap.add_argument("--agent", default=e("LLMSERVE_AGENT", "off"), choices=("on", "off"),
+                    help="coding-agent defaults: STRATA_CACHE_MESSAGE_BOUNDARY=1, STRATA_ADMIT_SHORT_FIRST=%d (parallel >= 2), "
+                         "--conversation-cache-mib %d" % (AGENT_ADMIT_SHORT_FIRST, AGENT_CONVERSATION_CACHE_MIB))
+    ap.add_argument("--conversation-cache-mib", type=int, default=env_int("LLMSERVE_CONVERSATION_CACHE_MIB"),
+                    help="RAM for parked conversations (0 = off; default: the engine sizes it, or %d with --agent on)"
+                         % AGENT_CONVERSATION_CACHE_MIB)
     ap.add_argument("--draft-vocab", default=e("LLMSERVE_DRAFT_VOCAB") or None, choices=list(C.DRAFT_VOCABS))
     ap.add_argument("--low-ram", default=e("LLMSERVE_LOW_RAM", "auto"), choices=("auto", "off", "on", "resident", "mmap"))
     ap.add_argument("--resident-budget-gib", type=float, default=(float(e("LLMSERVE_RESIDENT_BUDGET_GIB")) if e("LLMSERVE_RESIDENT_BUDGET_GIB") else None))
@@ -1375,6 +1474,8 @@ def settings_from(a: argparse.Namespace) -> Settings:
         raise Fail(str(e), code=2) from None
     if a.parallel is not None and a.parallel < 1:
         raise Fail("--parallel must be 1 or more", code=2)
+    if a.conversation_cache_mib is not None and a.conversation_cache_mib < 0:
+        raise Fail("--conversation-cache-mib must be 0 or more", code=2)
     try:
         q = C.resolve_quant(a.quant)
     except ValueError as e:
@@ -1387,7 +1488,8 @@ def settings_from(a: argparse.Namespace) -> Settings:
                     resident_budget_gib=a.resident_budget_gib, vram_reserve_mib=a.vram_reserve_mib,
                     rope_scaling=a.rope_scaling, rope_scale=a.rope_scale, gpu=a.gpu, port=a.port, extra_args=extra,
                     engine_env=eenv, hf_token_env=a.hf_token_env, hf_endpoint=a.hf_endpoint.strip().rstrip("/"),
-                    force=a.force)
+                    force=a.force, batch_mtp=a.batch_mtp == "on", batch_switches=a.batch_switches == "on",
+                    agent=a.agent == "on", conversation_cache_mib=a.conversation_cache_mib)
 
 
 def tri(v: str):

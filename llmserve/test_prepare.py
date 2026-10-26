@@ -179,6 +179,135 @@ def test_parallel_goes_to_the_config_not_the_args():
     assert "parallel" not in plan().cfg
 
 
+# ------------------------------------------------------------------------------------------- parallel slots and batch settings
+def test_parallel_recommendation_on_a_24gb_card_is_not_a_knife_edge():
+    arena = C.QUANTS["Q2_0"].arena_gb
+    for vram in (23.5, 23.99, 24.0, 24.5):                 # what a 4090 reports (23.99 GiB) and a little either side
+        assert P.parallel_recommend(vram, arena, 65536, "int8", False) == 2
+        assert P.parallel_recommend(vram, arena, 49152, "int8", False) == 3
+        assert P.parallel_recommend(vram, arena, 32768, "int8", False) == 4
+    assert P.parallel_recommend(24.0, arena, 131072, "int8", False) == 0      # 1.8 GB a slot: not worth it
+    assert P.parallel_recommend(24.0, arena, 65536, "int8", True) == 4        # streaming: a slot keeps 32K of KV in VRAM
+    assert P.parallel_recommend(24.0, arena, 65536, "q4_0", False) == 3       # half the KV memory
+    assert P.parallel_recommend(32.0, arena, 65536, "int8", False) == 3
+    for vram in (8.0, 12.0, 16.0):                          # a cache under 40% of the experts: no recommendation
+        assert P.parallel_recommend(vram, arena, 32768, "int8", False) == 0
+
+
+def test_parallel_slot_cost_matches_the_report_estimates():
+    gb = lambda ctx: P.parallel_slot_gb(ctx, "int8", False)
+    assert gb(32768) == pytest.approx(0.59, abs=0.01) and gb(49152) == pytest.approx(0.79, abs=0.01)
+    assert gb(65536) == pytest.approx(1.0, abs=0.01) and gb(131072) == pytest.approx(1.83, abs=0.01)
+    cache = P.parallel_cache_gb(24.0)
+    assert 0.04 < gb(65536) / cache < 0.07                 # about 5% of the expert cache a slot
+
+
+def test_parallel_two_on_a_24gb_wsl_card_gets_no_warning_but_says_estimate():
+    p = plan(machine=hw(vram=23.99, wsl=True), parallel=2)
+    assert p.warnings() == []
+    line = next(t for lvl, t in p.notes if t.startswith("parallel requests: 2"))
+    assert "estimate" in line and "1.0 GB" in line and "% of the" in line
+    assert p.cfg["parallel"] == 2
+
+
+def test_parallel_warnings_say_estimate_and_follow_the_card():
+    more = plan(machine=hw(vram=23.99, wsl=True), parallel=4)            # 4 x 1.0 GB at 64K: over 13% of the cache
+    assert any("recommended for this card at this context: 2" in w and "estimate" in w for w in more.warnings())
+    big = plan(machine=hw(vram=23.99, wsl=True), parallel=2, context=131072)   # 2 x 1.8 GB: no recommendation at all
+    assert any("estimate" in w and "5% of the single-request speed" in w and "19%" in w for w in big.warnings())
+    over = plan(machine=hw(vram=23.99, wsl=True), parallel=3, context=49152)
+    assert over.warnings() == []                                            # 3 slots at 48K is inside the recommendation
+    over = plan(machine=hw(vram=23.99, wsl=True), parallel=4, context=49152)
+    assert any("recommended for this card at this context: 3" in w and "estimate" in w for w in over.warnings())
+    small = plan(machine=hw(vram=12.0, wsl=True), parallel=2, context=32768)
+    assert any("10-25%" in w and "estimate" in w for w in small.warnings())
+
+
+def test_batch_mtp_only_with_two_slots_and_the_draft_layer():
+    on = dict(batch_mtp=True)
+    assert "--batch-mtp" in plan(parallel=2, **on).args
+    assert "--batch-mtp" not in plan(parallel=1, **on).args and "--batch-mtp" not in plan(**on).args
+    assert "--batch-mtp" not in plan(parallel=2, mtp=False, **on).args
+    assert any("needs the draft layer" in w for w in plan(parallel=2, mtp=False, **on).warnings())
+    assert "--batch-mtp" not in plan(parallel=2).args                   # off by default
+    assert "--batch-mtp" not in plan(parallel=1, batch_mtp=True, extra_args=("--spec", "3")).args
+
+
+def test_batch_switches_only_with_two_slots():
+    wsl = hw(wsl=True)                                                    # WSL: no KV streaming, so ATTN_ROWS is allowed
+    p = plan(machine=wsl, parallel=2, batch_switches=True)
+    assert p.cfg["env"] == {"STRATA_BATCH_GDN_GROUPS": "1", "STRATA_BATCH_ATTN_ROWS": "1", "STRATA_SLOT_COPY_DIRECT": "1",
+                            "STRATA_SLOT_COPY_BATCHSYNC": "1"}
+    assert "env" not in plan(machine=wsl, parallel=1, batch_switches=True).cfg
+    assert "env" not in plan(machine=wsl, parallel=2).cfg
+    streamed = plan(machine=hw(), parallel=2, batch_switches=True)       # native Linux, 64 GB: KV streaming (--kv-resident)
+    assert streamed.kv_streaming and "--kv-resident" in streamed.args
+    assert "STRATA_BATCH_ATTN_ROWS" not in streamed.cfg["env"] and streamed.cfg["env"]["STRATA_BATCH_GDN_GROUPS"] == "1"
+    mine = plan(machine=wsl, parallel=2, batch_switches=True, extra_args=("--kv-resident", "32768"))
+    assert "STRATA_BATCH_ATTN_ROWS" not in mine.cfg["env"]
+
+
+def test_engine_env_and_extra_args_win_over_the_new_defaults():
+    p = plan(machine=hw(wsl=True), parallel=2, batch_switches=True, agent=True, batch_mtp=True,
+             engine_env={"STRATA_SLOT_COPY_DIRECT": "0", "STRATA_X": "1"},
+             extra_args=("--conversation-cache-mib", "1024"))
+    assert p.cfg["env"]["STRATA_SLOT_COPY_DIRECT"] == "0" and p.cfg["env"]["STRATA_X"] == "1"
+    assert p.cfg["env"]["STRATA_BATCH_GDN_GROUPS"] == "1" and p.cfg["env"]["STRATA_CACHE_MESSAGE_BOUNDARY"] == "1"
+    assert P.arg_after(p.args, "--conversation-cache-mib") == "1024" and p.args.count("--conversation-cache-mib") == 1
+    assert "--batch-mtp" in p.args
+
+
+def test_agent_mode_settings():
+    p = plan(machine=hw(ram=64.0, wsl=True), agent=True)
+    assert p.cfg["env"] == {"STRATA_CACHE_MESSAGE_BOUNDARY": "1"}
+    assert P.arg_after(p.args, "--conversation-cache-mib") == "4096"
+    assert not any("ADMIT_SHORT_FIRST" in t for lvl, t in p.notes)       # one slot: no admission order to set
+    p2 = plan(machine=hw(ram=64.0, wsl=True), agent=True, parallel=2)
+    assert any("STRATA_ADMIT_SHORT_FIRST=4096" in t for lvl, t in p2.notes)
+    assert "STRATA_ADMIT_SHORT_FIRST" not in p2.cfg["env"]                # the server reads it, not the engine
+    assert "--conversation-cache-mib" not in plan().args                  # not without the setting
+    assert "env" not in plan().cfg
+
+
+def test_agent_conversation_cache_is_capped_by_the_ram_left():
+    q = C.QUANTS["Q2_0"]
+    tight = plan(machine=hw(ram=q.ram_gb + 4 + 2, wsl=True), agent=True)        # 2 GiB left beside the quant
+    assert P.arg_after(tight.args, "--conversation-cache-mib") == "2048"
+    none = plan(machine=hw(ram=q.ram_gb + 4, wsl=True), agent=True)             # nothing left: the engine sizes it
+    assert "--conversation-cache-mib" not in none.args and any("parking" in w for w in none.warnings())
+    assert none.cfg["env"] == {"STRATA_CACHE_MESSAGE_BOUNDARY": "1"}
+
+
+def test_conversation_cache_mib_setting():
+    p = plan(conversation_cache_mib=2048)
+    assert P.arg_after(p.args, "--conversation-cache-mib") == "2048"
+    assert P.arg_after(plan(conversation_cache_mib=0).args, "--conversation-cache-mib") == "0"
+    assert P.arg_after(plan(conversation_cache_mib=512, agent=True).args, "--conversation-cache-mib") == "512"   # explicit wins
+
+
+def test_new_settings_change_the_fingerprint():
+    base = plan(machine=hw(wsl=True), parallel=2).fingerprint
+    for kw in (dict(batch_mtp=True), dict(batch_switches=True), dict(agent=True), dict(conversation_cache_mib=2048)):
+        assert plan(machine=hw(wsl=True), parallel=2, **kw).fingerprint != base, kw
+    assert plan(machine=hw(wsl=True), parallel=2).fingerprint == base
+
+
+def test_new_settings_from_the_environment(monkeypatch):
+    for k, v in (("LLMSERVE_BATCH_MTP", "on"), ("LLMSERVE_BATCH_SWITCHES", "on"), ("LLMSERVE_AGENT", "on"),
+                 ("LLMSERVE_CONVERSATION_CACHE_MIB", "3000"), ("LLMSERVE_PARALLEL", "2")):
+        monkeypatch.setenv(k, v)
+    s = P.settings_from(P.build_parser().parse_args([]))
+    assert (s.batch_mtp, s.batch_switches, s.agent, s.conversation_cache_mib, s.parallel) == (True, True, True, 3000, 2)
+    s = P.settings_from(P.build_parser().parse_args(["--batch-mtp", "off", "--agent", "off", "--conversation-cache-mib", "0"]))
+    assert (s.batch_mtp, s.agent, s.conversation_cache_mib) == (False, False, 0)
+    for k in ("LLMSERVE_BATCH_MTP", "LLMSERVE_BATCH_SWITCHES", "LLMSERVE_AGENT", "LLMSERVE_CONVERSATION_CACHE_MIB"):
+        monkeypatch.delenv(k)
+    s = P.settings_from(P.build_parser().parse_args([]))
+    assert (s.batch_mtp, s.batch_switches, s.agent, s.conversation_cache_mib) == (False, False, False, None)
+    with pytest.raises(P.Fail):
+        P.settings_from(P.build_parser().parse_args(["--conversation-cache-mib", "-5"]))
+
+
 def test_multi_gpu_host_pins_one_card():
     p = plan(machine=hw(gpus=2))
     assert p.cfg["gpu"] == 0 and p.cfg["gpus_asked"] is True

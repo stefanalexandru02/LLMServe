@@ -41,9 +41,19 @@ export LLMSERVE_PORT="$PORT"
 # empty values from an unfilled .env line must not reach the tools as "set but empty"
 for v in LLMSERVE_EXTRA_ARGS LLMSERVE_KV LLMSERVE_KV_STREAMING LLMSERVE_MTP LLMSERVE_DRAFT_VOCAB LLMSERVE_LOW_RAM \
          LLMSERVE_RESIDENT_BUDGET_GIB LLMSERVE_VRAM_RESERVE_MIB LLMSERVE_ROPE_SCALING LLMSERVE_ROPE_SCALE LLMSERVE_GPU \
-         LLMSERVE_ENGINE_ENV LLMSERVE_VISION_TOKENS HF_TOKEN HF_ENDPOINT; do
+         LLMSERVE_ENGINE_ENV LLMSERVE_VISION_TOKENS HF_TOKEN HF_ENDPOINT LLMSERVE_BATCH_MTP LLMSERVE_BATCH_SWITCHES \
+         LLMSERVE_AGENT LLMSERVE_CONVERSATION_CACHE_MIB; do
   [ -z "${!v:-}" ] && unset "$v"
 done
+
+# LLMSERVE_AGENT=on with several slots: the Python server (not the engine) orders prompt reads short-first.  It reads this from
+# its own environment, which llmserve.prepare's cfg.json "env" does not reach.  A STRATA_ADMIT_SHORT_FIRST line in .env wins.
+case "$(printf '%s' "${LLMSERVE_AGENT:-off}" | tr '[:upper:]' '[:lower:]')" in
+  on)
+    if [ "${LLMSERVE_PARALLEL:-1}" -ge 2 ] 2>/dev/null; then
+      export STRATA_ADMIT_SHORT_FIRST="${STRATA_ADMIT_SHORT_FIRST:-4096}"
+    fi ;;
+esac
 
 # ---- minimum RAM per quant (GB): the catalog's "ram_gb" (llmserve/catalog.py; a test keeps the two in step)
 quant_ram_gb() {

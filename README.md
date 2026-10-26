@@ -109,8 +109,21 @@ Everything is a variable in `.env` (documented in `.env.example`); `docker compo
 - **`LLMSERVE_CONTEXT`**: tokens (`65536`, `131072`, `262144`, or `auto`). Longer contexts take VRAM from the expert cache (about 1.7 GB of
   KV per 128K at 8-bit), so output gets slower; Q2_0 loses 93 to 74 tok/s between 4K and 128K. Beyond 262,144 the engine switches on yarn rope scaling.
 - **`LLMSERVE_KV`**: `int8` (default), `q4_0` (half the KV memory, a little less exact), `k8v4`.
-- **`LLMSERVE_PARALLEL`**: 1 to 8 requests at once. 1 is fastest for a single user; on a card that holds only part of the experts, 2 to 4 slots
-  cost 10 to 25% per request.
+- **`LLMSERVE_PARALLEL`**: 1 to 8 requests at once. 1 is fastest for a single user. Every slot reserves the whole context of KV cache in VRAM, which
+  the expert cache then lacks. An estimate for Q2_0 with the default `int8` KV: about 1.0 GB per slot at 64K (0.6 GB at 32K, 1.8 GB at 128K),
+  about 5% of the expert cache of a 24 GB card, so on a 24 GB card 2 slots at 64K, 3 at 48K or 4 at 32K are recommended. On a card that holds only part
+  of the experts (12 to 16 GB) slots cost 10 to 25% speed per request. Setup prints the estimate and warns when you ask for more; the engine log prints the exact size.
+  Several slots mainly cut the waiting (a second agent no longer waits for the first answer to end); they add little total speed.
+- **`LLMSERVE_BATCH_MTP=on`** (needs `LLMSERVE_PARALLEL` of 2 or more and the draft layer): every slot also verifies one draft proposal per step (`--batch-mtp`).
+  If the log says `MTP admission ... failed`, turn it off again.
+- **`LLMSERVE_BATCH_SWITCHES=on`** (needs `LLMSERVE_PARALLEL` of 2 or more): the engine's opt-in batch switches `STRATA_BATCH_GDN_GROUPS=1`,
+  `STRATA_BATCH_ATTN_ROWS=1` (left out when the KV cache is streamed), `STRATA_SLOT_COPY_DIRECT=1`, `STRATA_SLOT_COPY_BATCHSYNC=1`. Each can be
+  overridden in `LLMSERVE_ENGINE_ENV`, which always wins.
+- **`LLMSERVE_AGENT=on`**: settings for a coding agent with a long system prompt and tool definitions: `STRATA_CACHE_MESSAGE_BOUNDARY=1` (a prompt
+  snapshot at the last message, so the next turn re-reads only the new part), with two or more slots `STRATA_ADMIT_SHORT_FIRST=4096` (a short sub-agent
+  request is read before a 30K cold prompt; the container entry point sets it for the server), and `--conversation-cache-mib 4096` (RAM for parked conversations; less when
+  the RAM left beside the model is short). **`LLMSERVE_CONVERSATION_CACHE_MIB`** sets that size yourself (0 = off) and wins over the agent value.
+  `LLMSERVE_EXTRA_ARGS` and `LLMSERVE_ENGINE_ENV` win over all of these. Changing any of them rewrites the run config; nothing is downloaded again.
 - **`LLMSERVE_VISION=on`**: the model reads pictures (downloads 0.9 GB more). With under 24 GB of VRAM the reader runs on the CPU.
 - **`LLMSERVE_DRAFT_VOCAB=en`**: ~215 MiB less VRAM for the draft head; use it on 12 GB cards or when the start says "the draft head does not fit".
 - **`LLMSERVE_VRAM_RESERVE_MIB`**: VRAM left free for Windows and other programs (default 700; try 1500 if the desktop stutters).
@@ -155,6 +168,33 @@ Then compare the two files (no server needed; `py llmserve\bench.py --compare ..
 ```powershell
 docker run --rm --entrypoint python -v ${PWD}:/out llmserve:cuda -m llmserve.bench --compare /out/bench-llmserve.json /out/bench-strata.json
 ```
+
+### Several requests at once
+
+`--concurrency 1,2,3,4` runs the benchmark with that many clients at the same time (threads released together), `--runs` rounds per level, and
+prints one table per level and a summary across levels: aggregate tok/s (completion tokens of the round divided by its wall time), the
+median and the slowest stream's decode tok/s, time to first token (p50 and p95), the longest gap between two tokens of a stream, and how many
+prompt tokens the server reused. While a round runs it also polls `GET /v1/status` and `/metrics` and saves their slot counters, to show that the slots were really used.
+
+```powershell
+docker exec llmserve python -m llmserve.bench --concurrency 1,2,3 --scenario shared-prefix --label parallel2 --out /data/conc-parallel2.json
+docker exec llmserve python -m llmserve.bench --concurrency 1,2,3 --scenario join --label parallel2 --out /data/conc-join.json
+```
+
+`--scenario` is one of (or a comma list of):
+
+- `independent` (default): every client a different prompt (`--prompt short` or `prompt-<N>k`), nothing reusable.
+- `shared-prefix`: every client sends the same system message of about `--prefix-tokens` (default 20000: header and document, like a system prompt with
+  tool definitions) and its own user message. The prefix is identical across clients, levels and rounds of one bench run, so the server can reuse
+  it; the per-request run id comes after it, in the user message, so the tails never match. A per-run session id at the top makes a second bench run start cold.
+  One uncounted request reads the prefix first and its cold TTFT is reported (`--no-prime` skips it).
+- `agent`: `shared-prefix`, then `--turns` (default 3) turns per client; each turn appends the answer and a new user message. Shows how well the follow-ups reuse the earlier turns.
+- `join`: N-1 clients decode a long answer (`--decode-tokens`, default 2048); `--join-delay` (default 3 s) later one more client sends a cold prompt
+  of `--prefix-tokens`. Reports the decoders' longest gap, their tok/s before and while the prompt is read, and the joiner's TTFT. Level 1 is the joiner alone (its TTFT is the baseline).
+
+Keep a setting only if one client gets less than about 8% slower and the 2 to 3 client numbers (aggregate, TTFT p95) improve. Restart the container between arms
+(`LLMSERVE_PARALLEL=1`, then `2` with `LLMSERVE_BATCH_MTP=on LLMSERVE_BATCH_SWITCHES=on`, ...), repeat in A, B, A, B order, and compare the files with `--compare` (it
+works on concurrency files too, per scenario and level).
 
 If the server needs a key, set `LLMSERVE_API_KEY` (or `STRATA_API_KEY`) or pass `--api-key`. Other options: `--runs`, `--cases`
 (`short,prompt-4k,prompt-16k`, or `prompt-32k` and so on), `--max-tokens` (default 512), `--timeout`.

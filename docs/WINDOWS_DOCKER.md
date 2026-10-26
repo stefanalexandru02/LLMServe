@@ -90,6 +90,14 @@ docker run --rm -v llmserve_llmserve-data:/data -v D:\gguf\Q2_0:/src:ro ubuntu:2
 - `WITH_VISION=0` skips the picture reader (about 10 minutes).
 - BuildKit's cache keeps the compiled objects between builds: changing `serve/` or `llmserve/` never rebuilds the engine, changing the engine sources rebuilds only what changed.
 
+## Several requests at once (24 GB cards)
+
+Because KV streaming is off here, every slot of `LLMSERVE_PARALLEL=2` or more keeps its whole KV cache in VRAM. An estimate for Q2_0 with `int8` KV: about 1.0 GB per slot at
+64K, 0.8 GB at 48K, 0.6 GB at 32K, about 5% of the expert cache of a 24 GB card. Setup recommends 2 slots at 64K, 3 at 48K and 4 at 32K there, and says "estimate" because the engine
+log (`--batch: N slot sessions ... GiB each`) has the exact size. Settings to try, one at a time: `LLMSERVE_PARALLEL=2`, then `LLMSERVE_BATCH_MTP=on`, then `LLMSERVE_BATCH_SWITCHES=on`;
+for a coding agent also `LLMSERVE_AGENT=on`. Measure each with `python -m llmserve.bench --concurrency 1,2,3` (README, "Several requests at once"). Do not combine `--kv-resident`
+(not written on WSL2 anyway) with `STRATA_BATCH_ATTN_ROWS`; setup leaves that switch out when the KV cache is streamed.
+
 ## First start timeline
 
 1. Build (10 to 30 minutes, once). 2. Download 66 GB (resumable; at 100 MB/s about 11 minutes, at 20 MB/s an hour). The hashes are checked once (a few minutes).
