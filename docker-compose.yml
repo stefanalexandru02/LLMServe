@@ -1,0 +1,65 @@
+# LLMServe: Qwen3.8-Flash-Next on an NVIDIA GPU, OpenAI/Anthropic-compatible API on http://localhost:8080/v1
+#
+#   copy .env.example .env          (Windows)        cp .env.example .env    (Linux/macOS shell)
+#   docker compose up -d --build                      # builds the engine for your GPU (set CUDA_ARCHS in .env first)
+#   docker compose logs -f                            # the first start downloads ~70 GB and packs it: watch it here
+#
+# Needs Docker Desktop (WSL2 backend) with an NVIDIA GPU, or Docker Engine + the NVIDIA Container Toolkit, and an NVIDIA
+# driver 580 or newer on the host.  docs/WINDOWS_DOCKER.md has the Windows details (.wslconfig memory!).
+name: llmserve
+
+services:
+  llmserve:
+    build:
+      context: .
+      args:                                     # read from .env; see the comments in Dockerfile
+        CUDA_ARCHS: ${CUDA_ARCHS:-86-real;89-real;120-real;120-virtual}
+        PORTABLE: ${PORTABLE:-ON}
+        WITH_VISION: ${WITH_VISION:-1}
+        BUILD_JOBS: ${BUILD_JOBS:-}
+    image: llmserve:cuda
+    container_name: llmserve
+    restart: unless-stopped
+
+    # All settings are LLMSERVE_* variables in .env (documented in .env.example).  Without a .env the defaults apply:
+    # Q2_0, 64K context, one request at a time, pictures off, no API key.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LLMSERVE_PORT: "8080"                     # the port INSIDE the container; the host side is LLMSERVE_HOST_PORT
+
+    ports:
+      # 127.0.0.1 = this computer only.  To let your network in, set LLMSERVE_BIND=0.0.0.0 AND LLMSERVE_API_KEY.
+      - "${LLMSERVE_BIND:-127.0.0.1}:${LLMSERVE_HOST_PORT:-8080}:8080"
+
+    # The model (tens of GB) lives in a NAMED VOLUME, not in a folder of your Windows drive.  On Docker Desktop a bind mount
+    # of C:\... is served to the container through a 9p/virtiofs bridge that is several times slower than the WSL2 disk,
+    # and the engine streams parts of the model from this folder.  A named volume sits on the WSL2 ext4 disk.
+    # (Find it with: docker volume inspect llmserve_llmserve-data;  free the space with: docker compose down -v)
+    volumes:
+      - llmserve-data:/data
+
+    # NVIDIA GPU.  Docker Desktop and Docker Engine both understand this form ("gpus: all" is the short form).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all                        # or: device_ids: ["0"]
+              capabilities: [gpu]
+
+    # The engine pins tens of GB of RAM (cudaHostRegister) so the GPU can read the experts quickly.  Without an unlimited
+    # memlock the pinning fails or falls back to slow paths.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    shm_size: 2gb                               # the picture reader uses /dev/shm
+    stop_grace_period: 2m                       # the model drains and unloads on `docker compose stop`
+
+    # DO NOT add mem_limit / deploy.resources.limits.memory: the engine plans from the machine's RAM and pins tens of GB.
+    # On Windows the limit that matters is the WSL2 VM's memory (.wslconfig), see docs/WINDOWS_DOCKER.md.
+
+volumes:
+  llmserve-data:

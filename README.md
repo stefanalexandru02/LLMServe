@@ -1,191 +1,168 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
+# LLMServe
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+Run **Qwen3.8-Flash-Next** fast on an NVIDIA GPU, in Docker, and talk to it over an OpenAI- and Anthropic-compatible HTTP API. No UI, no
+desktop app: one container, one port.
 
-<p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
-</p>
+LLMServe is a lean, headless fork of [**Strata**](https://github.com/niko1221/strata) by Niko1221 and contributors (MIT). The inference
+engine (CUDA kernels, hybrid GPU/CPU expert execution, MTP speculative decoding) and the API server are Strata's; this fork removes
+everything else (terminal app, desktop app, other models, other GPU vendors) and adds a Docker-first, unattended setup:
+`llmserve/prepare.py` replaces Strata's `setup.py` for this one model. The [colibri](https://github.com/JustVugg/colibri) engine
+was reviewed for ideas (WSL2 memory and storage advice came from it); none of its code is used.
 
-<p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
-</p>
+The model weights are not part of this repository. They are downloaded on first start from Hugging Face
+(ISTA-DASLab's GSQ-RCO quantizations of Qwen3.8-Flash-Next, pinned to fixed revisions and SHA-256 checked) and are subject to the
+[Qwen Community License](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
 
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a></sub></p>
+## Quick start (Windows 11, Docker Desktop, NVIDIA GPU)
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+You need:
 
-## Models
+- an NVIDIA GPU (RTX 30 series or newer with the default build; RTX 20: set `CUDA_ARCHS="75-real;75-virtual"`) and the **NVIDIA driver 580 or newer** (CUDA 13) installed on Windows. No CUDA toolkit needed.
+- **Docker Desktop** with the **WSL2 backend** (Settings > General > "Use the WSL 2 based engine"). Docker Desktop passes the GPU through itself.
+- **64 GB of RAM** for the default model (48 GB is the minimum, see the table), about **100 GB of free disk**.
+- **Give the WSL2 VM enough RAM.** By default WSL2 (and so Docker Desktop) gets only half of your Windows RAM, and the model needs
+  about 48 GB of it *pinned*. Create `%UserProfile%\.wslconfig` (for example `C:\Users\you\.wslconfig`):
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+  ```ini
+  # 64 GB PC
+  [wsl2]
+  memory=56GB
+  ```
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+  ```ini
+  # 128 GB PC (room for IQ3_S / UD-IQ4_XS and long contexts)
+  [wsl2]
+  memory=112GB
+  ```
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+  then run `wsl --shutdown` in PowerShell and start Docker Desktop again. Details and why: [docs/WINDOWS_DOCKER.md](docs/WINDOWS_DOCKER.md).
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
-
-</details>
-
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
-
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
-
-[Model guide and compatibility](docs/QWEN36.md).
-
-</details>
-
-<details>
-<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
-
-In the **desktop app** and the **Terminal**. What does not fit in memory is read from your SSD, so it needs a lot of free
-disk space.
-
-| Set (IST-DAS) | Download | Free disk needed |
-| --- | ---: | ---: |
-| 1.75 bpw | 239 GB | about 245 GB |
-| 2.00 bpw | 257 GB | about 265 GB |
-| 2.25 bpw | 274 GB | about 280 GB |
-
-Runs on NVIDIA RTX 30, 40 and 50 series (Windows and Linux) and AMD Radeon AI PRO R9700 (Linux). Setup downloads the
-files and the DeepSeek engine, then starts the model.
-
-```sh
-strata launch --family deepseek41 --model ist-das-2.00bpw --plan
-```
-
-Measured with the 2.00 bpw set on Strata 0.2.5. Output is the speed of the answer, prompt is how fast Strata reads your input.
-
-| Hardware | Output | Prompt |
-| --- | ---: | ---: |
-| RTX 5070 12 GB, 64 GB RAM | 4 to 6 tokens/s | about 110 tokens/s (4K) |
-| RTX 3060 12 GB, 46 GB RAM | 9 to 11 tokens/s | about 155 tokens/s (4K) |
-| 1x Radeon AI PRO R9700, 251 GB RAM | 21 to 25 tokens/s | 320 to 360 tokens/s (8K) |
-| 4x Radeon AI PRO R9700 | 74 to 77 tokens/s | 400 to 450 tokens/s (8K) |
-
-[Memory, disk and details](docs/DEEPSEEK41.md) · [Release notes](https://github.com/Niko1221/Strata/releases)
-
-</details>
-
-<a id="the-other-sizes"></a>
-
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
-
-## Install
-
-<a id="option-a-the-strata-app"></a>
-
-### Desktop app
-
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
-
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
-
-<sub>Files: `Strata-0.2.6-windows-x64-setup.exe` · `Strata-0.2.6-linux-x86_64.AppImage` · `Strata-0.2.6-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
-```
-
-**Windows PowerShell**
+Then, in PowerShell in this folder:
 
 ```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+copy .env.example .env
+notepad .env          # optional: pick LLMSERVE_QUANT, LLMSERVE_CONTEXT, set LLMSERVE_API_KEY; uncomment CUDA_ARCHS for your card
+docker compose up -d --build
+docker compose logs -f
 ```
 
-On Windows, open a new terminal afterwards. Then:
+- `CUDA_ARCHS` in `.env` cuts the build from 25+ minutes to about 10: `"86-real;86-virtual"` for RTX 30xx, `"89-real;89-virtual"` for RTX 40xx,
+  `"120-real;120-virtual"` for RTX 50xx. (`scripts\start.ps1` does the checks and sets this for you.)
+- The **first start** builds the engine, downloads ~66 GB (resumable: if it stops, `docker compose up -d` continues), packs the model
+  (a few minutes, ~40 GB written for Q2_0 on an AVX-512 CPU) and loads it. Allow one to two hours. The next starts take a few minutes.
+- The model lives in the Docker volume `llmserve_llmserve-data` (inside the WSL2 disk, deliberately not in a Windows folder).
+- It is ready when the log says `ready: http://127.0.0.1:8080/v1` and `http://localhost:8080/health` answers.
+
+Test it:
+
+```powershell
+$body = @{ model = "qwen3.8-flash-next"; max_tokens = 512
+           messages = @(@{ role = "user"; content = "Explain what a mixture-of-experts model is in two sentences." }) } | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Uri http://localhost:8080/v1/chat/completions -Method Post -ContentType "application/json" `
+  -Headers @{ Authorization = "Bearer $env:LLMSERVE_API_KEY" } -Body $body   # drop the header if you set no API key
+```
 
 ```sh
-strata launch
+curl http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer $LLMSERVE_API_KEY" \
+  -d '{"model":"qwen3.8-flash-next","messages":[{"role":"user","content":"Hello!"}],"max_tokens":512,"stream":true}'
 ```
 
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
+Connect any OpenAI-compatible client (Open WebUI, Continue, Cline, Aider, the `openai` SDK ...): **base URL `http://localhost:8080/v1`**, API key
+= your `LLMSERVE_API_KEY` (anything if none is set), model name anything (the server lists `qwen3.8-flash-next-q2_0`). Anthropic-style
+clients: base URL `http://localhost:8080`, endpoint `/v1/messages`. Also served: `/v1/models`, `/v1/responses`, `/health`, `/metrics`.
+Qwen3.8 thinks before it answers, and the thinking counts against `max_tokens`: give it room (512 or more).
 
-</details>
+Stop with `docker compose stop` (it drains running requests, up to two minutes), remove with `docker compose down` (the model stays in the
+volume; `docker compose down -v` deletes it). One-command helper that also checks the driver, `.wslconfig` and GPU passthrough:
+`powershell -ExecutionPolicy Bypass -File scripts\start.ps1`.
 
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
+## Which model size
 
-<a id="build-from-source"></a>
+All sizes are Qwen3.8-Flash-Next (a 48-layer, 512-expert MoE with a 262,144-token context). The experts sit in pinned RAM; the GPU holds
+the dense weights, the KV cache, the draft layer and a cache of the most-used experts, and the CPU computes the rest, so **RAM decides what
+fits and VRAM decides how fast it is** (about 700 more cached experts per extra GB of VRAM). 8 GB of VRAM and up starts; 12 to 16 GB is comfortable.
 
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+| `LLMSERVE_QUANT` | Download | RAM asked | Output tok/s (4K / 128K) | Prompt tok/s (4K / 32K) | Notes |
+| --- | ---: | ---: | --- | --- | --- |
+| **Q2_0** (default) | 66 GB | 48 GB | 93.0 / 73.7 | 1,299 / 2,171 | fastest, good quality |
+| IQ2_XS | 68 GB | 48 GB | 78.6 / 62.7 | 1,256 / 2,092 | a little better quality |
+| IQ3_XXS | 76 GB | 60 GB | 61.6 / 49.0 | 1,007 / 1,745 | |
+| IQ3_S | 84 GB | 62 GB | 53.3 / 45.5 | 913 / 1,624 | best of the small ones, needs a 64 GB PC with little else running |
+| IQ1_M (Coder) | 58 GB | 32 GB | 55.1 / 43.0 | 1,583 / 2,177 | half the experts, kept for code, tools and pictures; fits 32 to 40 GB of RAM |
+| UD-IQ4_XS | 94 GB | 48 GB, 80+ for all experts | not measured | not measured | Unsloth 4-bit; below ~80 GB of RAM part of the experts is read from the SSD |
+| UD-Q4_K_XL | 111 GB | 48 GB, 94+ for all experts | 7 to 8.5 on 64 GB RAM (SSD streaming) | - | Unsloth 4-bit K-quant |
+| UD-Q5_K_XL, UD-Q6_K_XL, Q8_0 | 158 to 188 GB | 108 to 136 GB | not measured | not measured | for 128 GB+ machines |
 
-<a id="what-you-need"></a>
+Speeds are Strata's own measurements (`docs/DETAILS.md` upstream): **RTX 5070 12 GB, Ryzen 5 7600, 64 GB DDR5-5200, native Windows,
+engine 0.1.26, MTP on**, one code-agent prompt per length. They are not measurements of this container. Newer engines are faster (+16 to 22%
+prompts from 0.1.36, +13 to 16% decode from 0.1.42), an RTX 5090 reaches 130 to 190 tok/s, and a community RTX 5060 Ti 16 GB under **WSL2**
+(IQ3_S) measured 48 tok/s output and 343 / 598 tok/s prompts at 3.8K / 19K. **Under WSL2 prompts are slower than on native Linux or
+Windows** (no KV streaming, see [docs/WINDOWS_DOCKER.md](docs/WINDOWS_DOCKER.md)); decoding is not much affected.
 
-## Hardware
+With less RAM than the quant asks for, LLMServe still starts in a *low-RAM mode* that reads experts from the SSD; it works but is much
+slower, and the log tells you so.
 
-| Supported hardware | Guide |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
+## Tuning
 
-<a id="using-it"></a>
+Everything is a variable in `.env` (documented in `.env.example`); `docker compose up -d` applies a change without downloading anything again.
 
-## Tools
+- **`LLMSERVE_CONTEXT`**: tokens (`65536`, `131072`, `262144`, or `auto`). Longer contexts take VRAM from the expert cache (about 1.7 GB of
+  KV per 128K at 8-bit), so output gets slower; Q2_0 loses 93 to 74 tok/s between 4K and 128K. Beyond 262,144 the engine switches on yarn rope scaling.
+- **`LLMSERVE_KV`**: `int8` (default), `q4_0` (half the KV memory, a little less exact), `k8v4`.
+- **`LLMSERVE_PARALLEL`**: 1 to 8 requests at once. 1 is fastest for a single user; on a card that holds only part of the experts, 2 to 4 slots
+  cost 10 to 25% per request.
+- **`LLMSERVE_VISION=on`**: the model reads pictures (downloads 0.9 GB more). With under 24 GB of VRAM the reader runs on the CPU.
+- **`LLMSERVE_DRAFT_VOCAB=en`**: ~215 MiB less VRAM for the draft head; use it on 12 GB cards or when the start says "the draft head does not fit".
+- **`LLMSERVE_VRAM_RESERVE_MIB`**: VRAM left free for Windows and other programs (default 700; try 1500 if the desktop stutters).
+- **`LLMSERVE_EXTRA_ARGS`**: any engine argument, e.g. `"--pool-workers 8"`. See what the container would run with
+  `docker compose run --rm llmserve prepare --dry-run`.
+- **`CUDA_ARCHS`, `PORTABLE`, `WITH_VISION`, `BUILD_JOBS`** (build): which GPU architectures to compile for; `PORTABLE=OFF` builds the CPU kernels with
+  `-march=native` for the PC that builds the image (build and run on the same machine); skip the picture reader; limit compiler jobs when the build runs out of memory.
+- **`LLMSERVE_API_KEY`**: clients must send it. Set it before changing `LLMSERVE_BIND` from `127.0.0.1` to `0.0.0.0` to open the port to your network.
 
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
+## Linux
 
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
+The same `docker-compose.yml` works on Linux with Docker Engine and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) (driver 580+). Native Linux is
+faster than WSL2: KV streaming (`--kv-resident`) and the in-RAM n-gram table (`--ple-io ram`, with 90+ GB of RAM) are used, and pinning is not limited
+by the WDDM driver. If the data directory must be a host folder, use `volumes: - /srv/llmserve:/data` and `chown 1000:1000` it (the container runs as uid 1000).
 
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
+## Troubleshooting
 
-## Help
+- **"no NVIDIA GPU is visible in this container"**, or no `nvidia-smi` output: check Docker passes the GPU through:
+  `docker run --rm --gpus all nvidia/cuda:13.0.2-base-ubuntu24.04 nvidia-smi`. On Windows this needs the WSL2 backend, a current driver, and a Docker Desktop
+  restart after driver updates.
+- **`unsatisfied condition: cuda>=13.0` / "driver too old"**: update the NVIDIA driver on Windows to 580 or newer (Game Ready or Studio, from nvidia.com).
+- **Out of memory / the container is killed (exit 137)**: the WSL2 VM has too little RAM (`.wslconfig`, above), or another program is using it. Check
+  `docker stats`. Choose a smaller quant, or a shorter `LLMSERVE_CONTEXT`. For *VRAM* errors: lower the context, `LLMSERVE_DRAFT_VOCAB=en`, `LLMSERVE_VISION=off`, close games.
+- **Very slow loading, or "is on a '9p' mount" in the log**: `/data` is on a Windows drive. Use the named volume of `docker-compose.yml`; do not bind-mount a Windows folder.
+- **"No space left on device"**: the Docker/WSL2 disk is full. The model needs ~110 GB while installing (66 GB download + packing). `docker system df`,
+  `docker builder prune`, and in Docker Desktop: Settings > Resources > Advanced > Disk image location / size.
+- **The image build is killed or hangs**: not enough memory. Set `BUILD_JOBS=4` and `CUDA_ARCHS` to your card in `.env`, give the WSL2 VM more RAM.
+- **A download keeps stopping**: it resumes from where it stopped on every start. Behind a mirror set `HF_ENDPOINT`; for a gated repository set `HF_TOKEN`.
+- **`401 missing or wrong API key`**: send `Authorization: Bearer <LLMSERVE_API_KEY>` (or `x-api-key`).
+- **Container shows `starting` for a long time**: normal during the first download and packing (the health check allows two hours); follow `docker compose logs -f`.
 
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](CONTRIBUTING.md)
+## Layout
 
-## Support Strata
+```
+Dockerfile, docker-compose.yml, .env.example   the container
+docker/entrypoint.sh                           checks the machine, runs prepare, execs the server
+llmserve/prepare.py, catalog.py                download, verify, pack, write /data/cfg.json (pins from Strata's setup.py)
+serve/, strata_control/, strata_cli/           Strata's HTTP server (OpenAI / Anthropic API) and what it imports
+src/, include/, CMakeLists.txt, third_party/   Strata's C++/CUDA engine
+tools/, data/                                  model packing tools, expert profile, draft vocabularies
+```
 
-**Help keep local AI open to everyone.** A coffee helps fund development and testing on more hardware.
+In the volume: `/data/models` (GGUF files), `/data/packs` (packed model), `/data/mtp` (draft layer), `/data/cfg.json` (what the server loads), `/data/logs/engine.log`.
 
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
+## Status
 
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
+The Python (prepare, catalog), shell and compose parts are unit-tested (`python -m pytest llmserve/test_prepare.py`). The CUDA image
+itself needs a machine with a GPU and several hours of download to test end to end; if something does not start, open an issue with the output
+of `docker compose logs`.
 
-<a id="option-c-let-your-ai-set-it-up"></a>
+## License
 
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
-
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
+MIT, see [LICENSE](LICENSE) (Niko1221 and contributors for Strata). ggml and llama.cpp code: MIT. Model licenses: Qwen Community License 1.0
+(Qwen3.8-Flash-Next and the quantizations of it), Apache-2.0 for the Coder release's own changes.
