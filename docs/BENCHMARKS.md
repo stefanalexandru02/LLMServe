@@ -130,3 +130,7 @@ Findings:
   run, faster than the bench's server-side `prompt tok/s` and TTFT suggest (16K TTFT 6.4-7.0 s). The 2-3 s gap at 16K
   grows with prompt size and is not in the engine's read; the server (template + Python BPE tokenizer) is the suspect,
   to be measured with per-phase server timings.
+
+Update: the server now logs one `server phases` line per request and puts the same numbers in `timings` (`server_render_ms`, `server_encode_ms`, `server_queue_ms`, `server_ttft_ms`, ...), and
+`llmserve/bench.py` shows them as rows; `tools/tokenizer_bench.py` measures the Python tokenizer's tokens/s. Run both on the 4090 before assuming the tokenizer is the missing 2-3 s. A start-up
+warm-up (docs/TTFT_WARMUP.md section 3) now removes the first-use costs listed above before the port opens.

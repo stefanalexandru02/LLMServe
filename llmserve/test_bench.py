@@ -41,6 +41,7 @@ class Fake(http.server.ThreadingHTTPServer):
         self.status = None            # JSON for GET /v1/status
         self.metrics = None           # JSON for GET /metrics
         self.fail_from = None         # index of the first request that gets a 500
+        self.server_phases = None     # extra keys for `timings` (the LLMServe server_* phases)
 
     @property
     def url(self):
@@ -134,6 +135,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "predicted_n": n, "predicted_per_second": 50.0 + 10 * idx if idx else 2.0}
             if srv.draft:
                 t.update(draft_n=100, draft_n_accepted=60 + idx)
+            if srv.server_phases:
+                t.update(srv.server_phases)
             final["timings"] = t
         send(final)
         self.wfile.write(b"data: [DONE]\n\n")
@@ -706,3 +709,138 @@ def test_compare_refuses_to_mix_modes_and_runs_on_real_files(fake, tmp_path, cap
     single.write_text(json.dumps(_result("s", 1.0)))
     assert B.main(["--compare", str(single), str(tmp_path / "one.json")]) == 2
     assert "concurrency" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the server's phases, and the output identity check
+
+PHASES = {"prompt_ms": 640.0, "server_render_ms": 12.0, "server_encode_ms": 340.0, "server_encode_tokens": 4000,
+          "server_encode_reused_chars": 0, "server_queue_ms": 1.0, "server_ttft_ms": 1100.0}
+
+
+def test_server_phases_get_a_row_each_in_the_case_table_and_the_comparison(fake, tmp_path, capsys):
+    fake.server_phases = PHASES
+    rc, data = _bench(fake, tmp_path, "--runs", "2", "--cases", "short", "--max-tokens", "20")
+    assert rc == 0
+    run = data["cases"]["short"]["runs"][0]
+    assert (run["server_render_ms"], run["server_encode_ms"], run["server_queue_ms"], run["server_ttft_ms"]) == (12.0, 340.0, 1.0, 1100.0)
+    assert run["engine_prompt_ms"] == 640.0
+    assert run["client_extra_ms"] == pytest.approx(run["ttft_s"] * 1000 - 1100.0)
+    text = capsys.readouterr().out
+    for label in ("server: template (ms)", "server: tokenize (ms)", "server: queue wait (ms)", "engine: prompt (ms)",
+                  "server: TTFT (ms)", "client TTFT - server (ms)"):
+        assert label in text, label
+    # a server that sends none of them: no such rows
+    fake.server_phases = None
+    rc, data2 = _bench(fake, tmp_path, "--runs", "1", "--cases", "short", "--max-tokens", "20")
+    assert "server_ttft_ms" in data2["cases"]["short"]["runs"][0] and data2["cases"]["short"]["runs"][0]["server_ttft_ms"] is None
+    assert "server: TTFT" not in capsys.readouterr().out
+    # --compare: a row each, with '-' on the side that has none
+    a, b = tmp_path / "pa.json", tmp_path / "pb.json"
+    a.write_text(json.dumps(data))
+    b.write_text(json.dumps(data2))
+    assert B.main(["--compare", str(a), str(b)]) == 0
+    row = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("server: tokenize (ms)"))
+    assert "340" in row and "-" in row
+
+
+def test_compare_texts():
+    assert B.compare_texts("same words here", "same words here") == {"identical": True, "offset": None, "len_a": 15, "len_b": 15}
+    c = B.compare_texts("one two three four five six seven eight nine ten", "one two three four five six sevenx eight nine ten")
+    assert not c["identical"] and c["offset"] == 33
+    assert c["before"] == "one two three four five six"
+    assert c["a_next"].startswith("seven eight") and c["b_next"].startswith("sevenx eight")
+    p = B.compare_texts("abc def", "abc def ghi")                       # one is the start of the other
+    assert not p["identical"] and p["offset"] == 7 and p["a_next"] == "<end of text>" and p["b_next"] == "def ghi"
+    u = B.compare_texts("caf\u00e9 au lait", "caf\u00e8 au lait")
+    assert u["offset"] == 3 and u["before"] == ""
+
+
+def _texts_script(pieces):
+    return lambda body: {"pieces": pieces, "piece_delay": 0.0, "prefill": 0.0}
+
+
+def test_fixed_id_makes_prompts_byte_identical_between_two_runs_and_save_text_keeps_the_answers(tmp_path, capsys):
+    outs, prompts = [], []
+    for name in ("a", "b"):
+        srv = Fake()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        srv.script = _texts_script(["alpha ", "beta ", "gamma"])
+        try:
+            out = tmp_path / (name + ".json")
+            assert B.main(["--url", srv.url, "--runs", "2", "--cases", "short,prompt-4k", "--max-tokens", "20",
+                           "--fixed-id", "ident-1", "--save-text", "--label", name, "--out", str(out)]) == 0
+            prompts.append([r["messages"][0]["content"] for r in srv.requests])
+            outs.append(json.loads(out.read_text()))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    assert prompts[0] == prompts[1]                                       # byte-identical across the two servers
+    assert prompts[0][0].startswith("Run id: ident-1-warmup\n")
+    assert prompts[0][1].startswith("Run id: ident-1-r1\n") and prompts[0][2].startswith("Run id: ident-1-r2\n")
+    assert len(set(prompts[0])) == len(prompts[0])                        # runs of one file differ: no prompt cache hit
+    r = outs[0]["cases"]["short"]["runs"][0]
+    assert r["text"] == "alpha beta gamma" and len(r["prompt_sha256"]) == 16
+    assert outs[0]["cases"]["short"]["runs"][0]["prompt_sha256"] == outs[1]["cases"]["short"]["runs"][0]["prompt_sha256"]
+    assert outs[0]["args"]["fixed_id"] == "ident-1" and outs[0]["args"]["save_text"] is True
+    capsys.readouterr()
+    assert B.main(["--compare", str(tmp_path / "a.json"), str(tmp_path / "b.json")]) == 0
+    text = capsys.readouterr().out
+    assert "== output identity" in text and "4 of 4 run(s) produced identical text" in text
+    assert "short run 1" in text and "prompt-4k run 2" in text and "DIFFERENT" not in text
+
+
+def test_compare_reports_where_two_outputs_first_differ(tmp_path, capsys):
+    files = []
+    for name, pieces in (("a", ["The answer is ", "forty-two, ", "as expected."]), ("b", ["The answer is ", "forty-three, ", "as expected."])):
+        srv = Fake()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        srv.script = _texts_script(pieces)
+        try:
+            out = tmp_path / (name + ".json")
+            assert B.main(["--url", srv.url, "--runs", "1", "--cases", "short", "--max-tokens", "20", "--fixed-id", "x",
+                           "--save-text", "--label", name, "--out", str(out)]) == 0
+            files.append(str(out))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    capsys.readouterr()
+    assert B.main(["--compare"] + files) == 0
+    text = capsys.readouterr().out
+    assert "0 of 1 run(s) produced identical text" in text and "MTP/speculation, batching" in text
+    assert "short run 1" in text and "DIFFERENT at character 21" in text
+    assert "same up to: ...The answer is" in text
+    assert "forty-two, as expected." in text and "forty-three, as expected." in text
+    assert "the prompts differ" not in text
+
+
+def test_compare_notes_the_prompts_differ_and_missing_texts(tmp_path, capsys):
+    ra, rb = _result("a", 1.0), _result("b", 1.0)
+    for r, sha, text in ((ra, "aaaa", "one two"), (rb, "bbbb", "one three")):
+        for run in r["cases"]["short"]["runs"]:
+            run.update(text=text, prompt_sha256=sha)
+    rb["cases"]["prompt-4k"]["runs"][0]["text"] = "x"                     # the other runs of prompt-4k have none
+    fa, fb = tmp_path / "a.json", tmp_path / "b.json"
+    fa.write_text(json.dumps(ra))
+    fb.write_text(json.dumps(rb))
+    assert B.main(["--compare", str(fa), str(fb)]) == 0
+    text = capsys.readouterr().out
+    assert "the prompts differ" in text and "no saved text in one of the files" in text and "--save-text" in text
+
+
+def test_no_identity_section_when_neither_file_has_texts(tmp_path, capsys):
+    fa, fb = tmp_path / "a.json", tmp_path / "b.json"
+    fa.write_text(json.dumps(_result("a", 1.0)))
+    fb.write_text(json.dumps(_result("b", 1.0)))
+    assert B.main(["--compare", str(fa), str(fb)]) == 0
+    assert "output identity" not in capsys.readouterr().out
+
+
+def test_identity_flags_are_for_the_single_stream_mode_and_checked(fake, tmp_path, capsys):
+    assert B.main(["--url", fake.url, "--concurrency", "1,2", "--fixed-id", "x"]) == 2
+    assert B.main(["--url", fake.url, "--concurrency", "1,2", "--save-text"]) == 2
+    assert B.main(["--url", fake.url, "--fixed-id", "  "]) == 2
+    assert "single-stream" in capsys.readouterr().err
+    assert fake.requests == []
+    rc, data = _bench(fake, tmp_path, "--runs", "1", "--cases", "short", "--max-tokens", "20")
+    assert "text" not in data["cases"]["short"]["runs"][0]                # nothing saved without --save-text

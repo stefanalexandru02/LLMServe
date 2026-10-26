@@ -450,6 +450,71 @@ def test_up_to_date_follows_settings_and_hardware(tmp_path):
     assert not P.up_to_date(p)
 
 
+def test_warmup_defaults_and_settings_reach_cfg_json(tmp_path):
+    _, cfg = written_cfg(tmp_path)
+    assert (cfg["warmup"], cfg["warmup_parks"]) == ("full", 4)
+    _, cfg = written_cfg(tmp_path / "b", warmup="short", warmup_parks=0)
+    assert (cfg["warmup"], cfg["warmup_parks"]) == ("short", 0)
+
+
+def test_warmup_is_not_part_of_the_fingerprint_but_cfg_json_must_follow_it(tmp_path):
+    p, _ = written_cfg(tmp_path)
+    for f in (p.shards[0], p.pack / "tokenizer" / "vocab.json", p.rt / "experts.bin"):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"x")
+    s2 = P.Settings(quant="Q2_0", data_dir=tmp_path, app_dir=APP, context=65536, warmup="off", warmup_parks=1)
+    p2 = P.build_plan(s2, hw())
+    assert p2.fingerprint == p.fingerprint and "warmup" not in p.settings.fingerprint_items()
+    assert not P.up_to_date(p2)                                   # cfg.json says full/4
+    assert P.up_to_date(p2, ignore_warmup=True)                   # ... and nothing else is different
+    assert P.refresh_warmup(p2) and not P.refresh_warmup(p2)
+    cfg = json.loads((tmp_path / "cfg.json").read_text())
+    assert (cfg["warmup"], cfg["warmup_parks"]) == ("off", 1) and cfg["args"] == p.args
+    assert P.up_to_date(p2)
+
+
+def test_an_old_cfg_json_without_the_keys_is_brought_up_to_date(tmp_path):
+    p, cfg = written_cfg(tmp_path)
+    for f in (p.shards[0], p.pack / "tokenizer" / "vocab.json", p.rt / "experts.bin"):
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"x")
+    del cfg["warmup"], cfg["warmup_parks"]
+    (tmp_path / "cfg.json").write_text(json.dumps(cfg))
+    assert not P.up_to_date(p) and P.up_to_date(p, ignore_warmup=True)
+    assert P.refresh_warmup(p)
+    assert json.loads((tmp_path / "cfg.json").read_text())["warmup"] == "full"
+
+
+def test_warmup_from_the_environment_and_the_command_line(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("LLMSERVE_WARMUP", "SHORT")
+    monkeypatch.setenv("LLMSERVE_WARMUP_PARKS", "2")
+    a = P.build_parser().parse_args(["--data-dir", str(tmp_path)])
+    s = P.settings_from(a)
+    assert (s.warmup, s.warmup_parks) == ("short", 2)
+    a = P.build_parser().parse_args(["--data-dir", str(tmp_path), "--warmup", "off", "--warmup-parks", "0"])
+    s = P.settings_from(a)
+    assert (s.warmup, s.warmup_parks) == ("off", 0)
+    monkeypatch.delenv("LLMSERVE_WARMUP")
+    monkeypatch.delenv("LLMSERVE_WARMUP_PARKS")
+    s = P.settings_from(P.build_parser().parse_args(["--data-dir", str(tmp_path)]))
+    assert (s.warmup, s.warmup_parks) == ("full", 4)
+    rc = P.main(["--dry-run", "--data-dir", str(tmp_path / "d"), "--ram-gib", "64", "--vram-gib", "24", "--warmup", "short"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "start-up warm-up: short" in out and '"warmup": "short"' in out
+
+
+def test_a_wrong_warmup_setting_exits_2(tmp_path):
+    assert P.main(["--dry-run", "--warmup", "quick", "--data-dir", str(tmp_path)]) == 2
+    assert P.main(["--dry-run", "--warmup-parks", "99", "--data-dir", str(tmp_path)]) == 2
+    assert P.main(["--dry-run", "--warmup-parks", "-1", "--data-dir", str(tmp_path)]) == 2
+
+
+def test_the_server_reads_the_warmup_keys_prepare_writes(tmp_path):
+    from serve import warmup
+    _, cfg = written_cfg(tmp_path, warmup="short", warmup_parks=3)
+    assert warmup.settings(cfg, {}) == ("short", 3)
+
+
 # ------------------------------------------------------------------------------------------- command line
 def test_dry_run_prints_the_plan_and_changes_nothing(tmp_path, capsys):
     target = tmp_path / "never-created"
@@ -679,5 +744,17 @@ def test_full_run_with_fake_tools_then_nothing_to_do(tmp_path, monkeypatch, caps
     calls.clear()
     assert P.main(argv) == 0                                   # same settings: current, nothing runs
     assert calls == [] and "nothing to do" in capsys.readouterr().out
+    # only the warm-up settings changed: the two keys of cfg.json are rewritten, nothing else runs or changes
+    assert json.loads((data / "cfg.json").read_text())["warmup"] == "full"
+    state_before = (data / "state" / "prepare.json").read_text()
+    assert P.main(argv + ["--warmup", "short", "--warmup-parks", "2"]) == 0
+    out = capsys.readouterr().out
+    assert calls == [] and "run config updated" in out and "nothing to do" not in out
+    cfg2 = json.loads((data / "cfg.json").read_text())
+    assert (cfg2["warmup"], cfg2["warmup_parks"]) == ("short", 2)
+    assert {k: v for k, v in cfg2.items() if k not in P.WARMUP_KEYS} == {k: v for k, v in cfg.items() if k not in P.WARMUP_KEYS}
+    assert (data / "state" / "prepare.json").read_text() == state_before        # the fingerprint did not move
+    assert P.main(argv + ["--warmup", "short", "--warmup-parks", "2"]) == 0     # and now it is current again
+    assert "nothing to do" in capsys.readouterr().out
     assert P.main(argv[:-1] + ["--force"]) == 0                # --force remakes the pack and the draft layer
     assert "strata_pack.py" in calls and "mtp_rt.py" in calls

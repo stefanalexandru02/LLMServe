@@ -320,6 +320,8 @@ class Settings:
     batch_switches: bool = False      # parallel >= 2: the STRATA_BATCH_* / STRATA_SLOT_COPY_* switches (BATCH_SWITCH_ENV)
     agent: bool = False               # agent-friendly defaults (message-boundary cache, short-first admission, parked chats)
     conversation_cache_mib: int | None = None   # --conversation-cache-mib (default: the engine's own sizing, or 4096 with agent)
+    warmup: str = "full"              # the server's start-up warm-up: off | short | full (cfg.json "warmup"; not in the fingerprint)
+    warmup_parks: int = 4             # conversations the warm-up parks to fault the engine's RAM cache in ("warmup_parks")
 
     def __post_init__(self):
         self.data_dir = Path(self.data_dir)
@@ -351,6 +353,24 @@ def parse_context(value: int | str) -> int | str:
     if v.isdigit():
         return int(v)
     raise ValueError(f"cannot read the context {value!r}: use a number of tokens, 64k, 128k ... or auto")
+
+
+WARMUP_MODES = ("off", "short", "full")
+WARMUP_TEXT = {"off": "start-up warm-up: off (the first requests after a start pay the cold-start costs)",
+               "short": "start-up warm-up: short (a 2K prefill and a ~120-token request before the port opens)",
+               "full": "start-up warm-up: full (a 16K prefill, a 768-token decode and a short request before the port "
+                       "opens; /health answers once it is done)"}
+
+
+def parse_warmup(value: str) -> str:
+    v = (value or "full").strip().lower()
+    if v in ("", "default", "on", "yes", "true", "1"):
+        return "full"
+    if v in ("no", "false", "0", "none"):
+        return "off"
+    if v in WARMUP_MODES:
+        return v
+    raise ValueError(f"LLMSERVE_WARMUP must be off, short or full, not {value!r}")
 
 
 def parse_vision(value: str) -> str:
@@ -824,7 +844,10 @@ def build_plan(s: Settings, hw: Hardware, *, ple_gb: float | None = None, files_
     lib_dirs = [d for d in ("/usr/local/cuda/lib64", "/usr/lib/wsl/lib") if os.path.isdir(d)] or ["/usr/local/cuda/lib64"]
     cfg: dict = {"exe": str(s.engine_dir / "strata"), "args": args, "cwd": str(data),
                  "tokenizer": str(pack / "tokenizer"), "model_name": f"{fam.model_name}-{q.name.lower()}",
-                 "log": str(data / "logs" / "engine.log"), "lib_dirs": lib_dirs, "port": s.port}
+                 "log": str(data / "logs" / "engine.log"), "lib_dirs": lib_dirs, "port": s.port,
+                 "warmup": s.warmup, "warmup_parks": s.warmup_parks}
+    ok_(WARMUP_TEXT[s.warmup] + (f"; {s.warmup_parks} conversations parked to touch the RAM cache" if s.warmup != "off"
+                                 and s.warmup_parks else ""))
     env = {**unsloth_env(q, in_budget), **gen_env, **s.engine_env}
     if env:
         cfg["env"] = env
@@ -1329,8 +1352,13 @@ def step_config(plan: Plan, ple_gb: float | None) -> Plan:
     return plan
 
 
-def up_to_date(plan: Plan) -> bool:
-    """cfg.json exists, was made from these settings on this kind of machine, and its files are all still there."""
+WARMUP_KEYS = ("warmup", "warmup_parks")
+
+
+def up_to_date(plan: Plan, ignore_warmup: bool = False) -> bool:
+    """cfg.json exists, was made from these settings on this kind of machine, and its files are all still there.  The
+    warm-up keys are not part of the fingerprint (changing them must not redo any download or pack), but cfg.json has to
+    say what is asked now: a different value is "not up to date" unless `ignore_warmup` (see refresh_warmup)."""
     try:
         st = json.loads((plan.settings.data_dir / "state" / "prepare.json").read_text())
         cfg = json.loads(plan.cfg_path.read_text())
@@ -1341,7 +1369,26 @@ def up_to_date(plan: Plan) -> bool:
     need = [plan.shards[0], plan.pack / "tokenizer" / "vocab.json"]
     if plan.settings.mtp:
         need.append(plan.rt / "experts.bin")
+    if not ignore_warmup and any(cfg.get(k) != plan.cfg.get(k) for k in WARMUP_KEYS):
+        return False
     return all(p.exists() for p in need) and cfg.get("exe") == plan.cfg["exe"]
+
+
+def refresh_warmup(plan: Plan) -> bool:
+    """Everything is current except the warm-up keys (LLMSERVE_WARMUP / LLMSERVE_WARMUP_PARKS changed since cfg.json was
+    written): rewrite just those two keys in cfg.json, atomically.  -> True when it was changed."""
+    try:
+        cfg = json.loads(plan.cfg_path.read_text())
+    except (OSError, ValueError):
+        return False
+    if all(cfg.get(k) == plan.cfg.get(k) for k in WARMUP_KEYS):
+        return False
+    old = {k: cfg.get(k) for k in WARMUP_KEYS}
+    cfg.update({k: plan.cfg[k] for k in WARMUP_KEYS})
+    write_json_atomic(plan.cfg_path, cfg)
+    ok(f"run config updated: warmup {old['warmup']!r}/{old['warmup_parks']!r} -> {plan.cfg['warmup']!r}/"
+       f"{plan.cfg['warmup_parks']!r} (nothing else changed)")
+    return True
 
 
 # ------------------------------------------------------------------------------------------- reporting
@@ -1436,6 +1483,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--conversation-cache-mib", type=int, default=env_int("LLMSERVE_CONVERSATION_CACHE_MIB"),
                     help="RAM for parked conversations (0 = off; default: the engine sizes it, or %d with --agent on)"
                          % AGENT_CONVERSATION_CACHE_MIB)
+    ap.add_argument("--warmup", default=e("LLMSERVE_WARMUP", "full"),
+                    help="start-up warm-up before the port opens: off | short | full (default full: a 16K prefill, a "
+                         "768-token decode, the conversation cache touched, a short request; ~30-60 s)")
+    ap.add_argument("--warmup-parks", type=int, default=env_int("LLMSERVE_WARMUP_PARKS"),
+                    help="conversations the warm-up parks so the RAM cache is faulted in at start (0 = none; default 4)")
     ap.add_argument("--draft-vocab", default=e("LLMSERVE_DRAFT_VOCAB") or None, choices=list(C.DRAFT_VOCABS))
     ap.add_argument("--low-ram", default=e("LLMSERVE_LOW_RAM", "auto"), choices=("auto", "off", "on", "resident", "mmap"))
     ap.add_argument("--resident-budget-gib", type=float, default=(float(e("LLMSERVE_RESIDENT_BUDGET_GIB")) if e("LLMSERVE_RESIDENT_BUDGET_GIB") else None))
@@ -1477,6 +1529,13 @@ def settings_from(a: argparse.Namespace) -> Settings:
     if a.conversation_cache_mib is not None and a.conversation_cache_mib < 0:
         raise Fail("--conversation-cache-mib must be 0 or more", code=2)
     try:
+        warmup = parse_warmup(a.warmup)
+    except ValueError as e:
+        raise Fail(str(e), code=2) from None
+    parks = 4 if a.warmup_parks is None else a.warmup_parks
+    if not 0 <= parks <= 64:
+        raise Fail("--warmup-parks (LLMSERVE_WARMUP_PARKS) must be 0 to 64", code=2)
+    try:
         q = C.resolve_quant(a.quant)
     except ValueError as e:
         raise Fail(str(e), code=2) from None
@@ -1489,7 +1548,8 @@ def settings_from(a: argparse.Namespace) -> Settings:
                     rope_scaling=a.rope_scaling, rope_scale=a.rope_scale, gpu=a.gpu, port=a.port, extra_args=extra,
                     engine_env=eenv, hf_token_env=a.hf_token_env, hf_endpoint=a.hf_endpoint.strip().rstrip("/"),
                     force=a.force, batch_mtp=a.batch_mtp == "on", batch_switches=a.batch_switches == "on",
-                    agent=a.agent == "on", conversation_cache_mib=a.conversation_cache_mib)
+                    agent=a.agent == "on", conversation_cache_mib=a.conversation_cache_mib,
+                    warmup=warmup, warmup_parks=parks)
 
 
 def tri(v: str):
@@ -1519,6 +1579,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.if_changed and not s.force and up_to_date(plan):
             ok(f"cfg.json is current for these settings ({plan.quant.name}, {plan.ctx} tokens): nothing to do")
             return 0
+        if a.if_changed and not s.force and up_to_date(plan, ignore_warmup=True) and refresh_warmup(plan):
+            return 0                                  # only the warm-up settings differed: two keys rewritten
         print_plan(plan, dry=False)
         check_environment(plan)
         free = free_gb(s.data_dir)

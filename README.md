@@ -124,6 +124,15 @@ Everything is a variable in `.env` (documented in `.env.example`); `docker compo
   request is read before a 30K cold prompt; the container entry point sets it for the server), and `--conversation-cache-mib 4096` (RAM for parked conversations; less when
   the RAM left beside the model is short). **`LLMSERVE_CONVERSATION_CACHE_MIB`** sets that size yourself (0 = off) and wins over the agent value.
   `LLMSERVE_EXTRA_ARGS` and `LLMSERVE_ENGINE_ENV` win over all of these. Changing any of them rewrites the run config; nothing is downloaded again.
+- **`LLMSERVE_WARMUP=full|short|off`** (default `full`) and **`LLMSERVE_WARMUP_PARKS=4`**: after the model is loaded and *before* the port opens, the server
+  sends requests of its own so that your first request does not pay the cold-start costs (thinking off, greedy; the engine keeps none of them except
+  the parks): a ~16K-token prefill (code in several languages, prose, a JSON tool call), a ~1K prompt with 768 new tokens (enough for the engine's PCIe-share
+  auto-tune, which logs `PCIe share: ... pcie_frac`), N short *different* conversations that the engine does keep, and a ~120-token request. The parks
+  touch the engine's RAM conversation cache once at start: parking a conversation into fresh RAM costs about 2.4 s under WSL2 until the cache's 4 places have been used.
+  They are the oldest entries, so your own conversations replace them first. `short` runs a 2K prefill, the parks and the short request (about a third of the time);
+  `off` skips it. It costs roughly 30 to 60 s on every start (an estimate; the log prints yours), during which the container is `starting` and `/health` does not answer (the port is closed). A step that fails is
+  logged and skipped; the server always starts. Not run with a lazy start. Changing either variable rewrites two keys of `/data/cfg.json` (nothing is downloaded or packed again).
+  The log shows each step and its duration: see [docs/TTFT_WARMUP.md](docs/TTFT_WARMUP.md).
 - **`LLMSERVE_VISION=on`**: the model reads pictures (downloads 0.9 GB more). With under 24 GB of VRAM the reader runs on the CPU.
 - **`LLMSERVE_DRAFT_VOCAB=en`**: ~215 MiB less VRAM for the draft head; use it on 12 GB cards or when the start says "the draft head does not fit".
 - **`LLMSERVE_VRAM_RESERVE_MIB`**: VRAM left free for Windows and other programs (default 700; try 1500 if the desktop stutters).
@@ -132,6 +141,21 @@ Everything is a variable in `.env` (documented in `.env.example`); `docker compo
 - **`CUDA_ARCHS`, `PORTABLE`, `WITH_VISION`, `BUILD_JOBS`** (build): which GPU architectures to compile for; `PORTABLE=OFF` builds the CPU kernels with
   `-march=native` for the PC that builds the image (build and run on the same machine); skip the picture reader; limit compiler jobs when the build runs out of memory.
 - **`LLMSERVE_API_KEY`**: clients must send it. Set it before changing `LLMSERVE_BIND` from `127.0.0.1` to `0.0.0.0` to open the port to your network.
+
+Where does the time to the first token go? Besides the engine's own `strata serve: prompt ...` line, the server logs one line per request with its phases
+(`docker compose logs llmserve | grep "server phases"`):
+
+```
+[strata] request 3f9a1c0d2b7e server phases: render 12 ms, encode 340 ms (16512 tokens from 52013 chars, 48,500 tok/s), queue 0 ms, engine prompt 3812 ms, first token 4401 ms after the request arrived (other 237 ms)
+```
+
+`render` is the chat template, `encode` the Python tokenizer (with the characters taken from the previous turn's encode when the conversation goes on), `queue` the
+wait for the engine's turn, `engine prompt` the engine's own prompt time, and `other` what is left of the time to the first token (HTTP, the first decode window, parsing).
+The same numbers are in the response's `timings` object (`server_render_ms`, `server_encode_ms`, `server_encode_tokens`, `server_prompt_chars`,
+`server_encode_reused_chars`, `server_queue_ms`, `server_ttft_ms`, next to the existing `prompt_ms` and `predicted_per_second`) and in `/metrics` history rows.
+`python tools/tokenizer_bench.py` (in the container: `docker compose exec llmserve python tools/tokenizer_bench.py`) measures the tokenizer alone on the model's own vocabulary:
+tokens/s cold and warm on repetitive text and on this repository's sources, the encode time for 32K, 128K and 256K tokens, and, if `pip install tokenizers` is
+available, the speed and the exact id equality of Hugging Face's Rust tokenizer on the same text.
 
 ## Benchmark: LLMServe vs original Strata
 
@@ -196,6 +220,31 @@ Keep a setting only if one client gets less than about 8% slower and the 2 to 3 
 (`LLMSERVE_PARALLEL=1`, then `2` with `LLMSERVE_BATCH_MTP=on LLMSERVE_BATCH_SWITCHES=on`, ...), repeat in A, B, A, B order, and compare the files with `--compare` (it
 works on concurrency files too, per scenario and level).
 
+The server's own phases (template, tokenizer, queue wait, first token as the server saw it) get a row each in the per-case table and in `--compare` when the server
+sends them in `timings` (LLMServe does; a row is left out when neither side has the number): `server: template (ms)`, `server: tokenize (ms)`, `server: chars reused`,
+`server: queue wait (ms)`, `engine: prompt (ms)`, `server: TTFT (ms)` and `client TTFT - server (ms)` (the network and HTTP part).
+
+### Does a change alter what the model says? (output identity)
+
+Switching the engine, a setting or a build can change the output without anyone noticing, so `--fixed-id` and `--save-text` check it. With temperature 0 the same prompt should
+give the same text; run the identical command against both configurations and compare:
+
+```powershell
+# configuration A (e.g. LLMSERVE_EXTRA_ARGS as it is), then change the setting and `docker compose up -d`, then B
+docker exec llmserve python -m llmserve.bench --fixed-id identity-1 --save-text --runs 3 --max-tokens 400 --label A --out /data/id-A.json
+docker exec llmserve python -m llmserve.bench --fixed-id identity-1 --save-text --runs 3 --max-tokens 400 --label B --out /data/id-B.json
+docker exec llmserve python -m llmserve.bench --compare /data/id-A.json /data/id-B.json
+```
+
+`--fixed-id STR` replaces the random run id on the first line of the prompt with `STR-r1`, `STR-r2` ... (run number; `STR-warmup` for the warm-up), so run N of A and run N of B
+are byte-identical prompts (the saved prompt hash proves it), while the runs of one file still differ from each other and no prompt cache can answer a later run. `--save-text`
+stores each run's generated text in the JSON. `--compare` then adds an "output identity" section: for every case and run, `identical` or `DIFFERENT at character N` with the
+words in front of the difference and the next words of each side. Use `--max-tokens` of a few hundred so a divergence has room to show, and compare the same `--cases`.
+Notes: both runs must have thinking off and temperature 0 (the bench sends both); a run that stops early on one side only is a difference too. Speculative decoding (MTP) and batching
+can legitimately change a few tokens on some GPUs (a different kernel, a different rounding at a near tie), and everything after the first changed token follows from it, so a
+difference is something to look at, not proof of a bug: see whether it is one word or a different answer, and whether it also happens between two runs of the *same* configuration
+(run A twice). Do not assume either way.
+
 If the server needs a key, set `LLMSERVE_API_KEY` (or `STRATA_API_KEY`) or pass `--api-key`. Other options: `--runs`, `--cases`
 (`short,prompt-4k,prompt-16k`, or `prompt-32k` and so on), `--max-tokens` (default 512), `--timeout`.
 
@@ -231,6 +280,7 @@ by the WDDM driver. If the data directory must be a host folder, use `volumes: -
 - **A download keeps stopping**: it resumes from where it stopped on every start. Behind a mirror set `HF_ENDPOINT`; for a gated repository set `HF_TOKEN`.
 - **`401 missing or wrong API key`**: send `Authorization: Bearer <LLMSERVE_API_KEY>` (or `x-api-key`).
 - **Container shows `starting` for a long time**: normal during the first download and packing (the health check allows two hours); follow `docker compose logs -f`.
+  After the model has loaded it stays `starting` for the start-up warm-up (roughly 30 to 60 s; the log prints it) (`LLMSERVE_WARMUP=off` skips it).
 
 ## Layout
 
@@ -238,7 +288,9 @@ by the WDDM driver. If the data directory must be a host folder, use `volumes: -
 Dockerfile, docker-compose.yml, .env.example   the container
 docker/entrypoint.sh                           checks the machine, runs prepare, execs the server
 llmserve/prepare.py, catalog.py                download, verify, pack, write /data/cfg.json (pins from Strata's setup.py)
-llmserve/bench.py                              stdlib-only speed benchmark and A/B compare (see Benchmark)
+llmserve/bench.py                              stdlib-only speed benchmark, A/B compare, output identity check (see Benchmark)
+serve/warmup.py                                the start-up warm-up the server runs before it opens the port (see Tuning)
+tools/tokenizer_bench.py                       tokenizer throughput on the model's vocabulary, optional Hugging Face tokenizers comparison
 serve/, strata_control/, strata_cli/           Strata's HTTP server (OpenAI / Anthropic API) and what it imports
 src/, include/, CMakeLists.txt, third_party/   Strata's C++/CUDA engine
 tools/, data/                                  model packing tools, expert profile, draft vocabularies

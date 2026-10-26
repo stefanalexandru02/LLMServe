@@ -3859,6 +3859,8 @@ class Service:
         self.api_monitor = False
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
+        # this request's server-side phases (render, encode, queue, first token), per handler thread: see phase_begin()
+        self.phases = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -4725,15 +4727,50 @@ class Service:
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
+        t0 = time.perf_counter()
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
+        t1 = time.perf_counter()
+        reused = 0
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
-            return self.prompts.encode(prompt, plain, store)
-        return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
-            self.tok.encode(prompt, parse_special=True)
+            ids = self.prompts.encode(prompt, plain, store)
+            reused = self.prompts.reused_here()
+        else:
+            ids = self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
+                self.tok.encode(prompt, parse_special=True)
+        self.phase_note(render_ms=(t1 - t0) * 1000.0, encode_ms=(time.perf_counter() - t1) * 1000.0,
+                        encode_tokens=len(ids), prompt_chars=len(prompt), encode_reused_chars=reused)
+        return ids
+
+    # ---- per-request server phases.  A request's handler thread calls phase_begin() when the request arrives; the
+    # template render and the tokenizer (encode_prompt), the wait for the engine's turn and the first token handed to
+    # the HTTP layer (_run) then note their figures, and _run puts them in `timings` (server_*_ms) and the log.  Code
+    # that never called phase_begin (a direct svc.run in a test) notes nothing.
+    def phase_begin(self) -> dict:
+        self.phases.d = d = {"t0": time.perf_counter()}
+        return d
+
+    def phase_note(self, **values) -> None:
+        d = getattr(self.phases, "d", None)
+        if d is not None:
+            d.update(values)
+
+    PHASE_KEYS = (("render_ms", "server_render_ms"), ("encode_ms", "server_encode_ms"),
+                  ("encode_tokens", "server_encode_tokens"), ("prompt_chars", "server_prompt_chars"),
+                  ("encode_reused_chars", "server_encode_reused_chars"), ("queue_ms", "server_queue_ms"),
+                  ("ttft_ms", "server_ttft_ms"))
+
+    @classmethod
+    def phase_fields(cls, d: dict | None) -> dict:
+        """The noted phases under their `timings` names (milliseconds rounded to 0.1; only what was measured)."""
+        out = {}
+        for src, dst in cls.PHASE_KEYS:
+            if d is not None and d.get(src) is not None:
+                out[dst] = round(d[src], 1) if src.endswith("_ms") else int(d[src])
+        return out
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -5103,6 +5140,15 @@ class Service:
         timed_out = False
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
+        ph = getattr(self.phases, "d", None)        # this request's server-side phases (phase_begin); a run without one keeps its own
+        if ph is None:
+            ph = {"t0": waiting}
+
+        def sent(ev):
+            """The first thing a client can read (text, or a call) is on its way: server_ttft_ms."""
+            if "ttft_ms" not in ph and (ev.kind in ("tool_start", "tool_call") or
+                                        (ev.kind in ("content", "reasoning") and ev.text)):
+                ph["ttft_ms"] = (time.perf_counter() - ph["t0"]) * 1000.0
         first_engine_token_s = None  # this request, from entering the engine queue; includes queue/prefill
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
@@ -5161,6 +5207,7 @@ class Service:
                         yield "ping", None
             with turn:
                 try:
+                    ph["queue_ms"] = (time.perf_counter() - waiting) * 1000.0
                     with self.status_lock:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
@@ -5198,6 +5245,7 @@ class Service:
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     for ev in opening:
+                        sent(ev)
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
@@ -5256,6 +5304,7 @@ class Service:
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
+                                    sent(ev)
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -5464,7 +5513,8 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                **self.phase_fields(ph)})
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -5480,6 +5530,8 @@ class Service:
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
+                                if timings:
+                                    timings.update(self.phase_fields(ph))      # server_render_ms ... server_ttft_ms
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
                             now = time.time()
@@ -5492,6 +5544,9 @@ class Service:
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                            phase_line = phases_line(request_id, ph, last.get("prompt_ms"))
+                            if phase_line:
+                                print(phase_line, flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -5534,6 +5589,7 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            sent(ev)
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
@@ -5552,6 +5608,38 @@ class Service:
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
+
+
+def phases_line(request_id: str, ph: dict | None, engine_prompt_ms) -> str | None:
+    """One compact line per request with the server's own phases (Service.phase_note), next to the engine's
+    `strata serve: prompt ...` line: where the time between "request received" and "first token sent" went outside
+    the engine (the template, the tokenizer, the wait for the engine's turn).  `other` is what none of them explains:
+    the HTTP read, the engine's first decode window, the token's detokenizing and parsing.  None: nothing measured."""
+    if not ph:
+        return None
+    parts, known = [], 0.0
+    if ph.get("render_ms") is not None:
+        parts.append(f"render {ph['render_ms']:.0f} ms")
+        known += ph["render_ms"]
+    if ph.get("encode_ms") is not None:
+        reused = ph.get("encode_reused_chars") or 0
+        # a rate only for a prompt encoded whole: with a reused start the tokens it holds were not all encoded now
+        rate = f", {ph['encode_tokens'] / ph['encode_ms'] * 1000:,.0f} tok/s" \
+            if not reused and ph.get("encode_tokens") and ph["encode_ms"] > 0 else ""
+        parts.append(f"encode {ph['encode_ms']:.0f} ms ({ph.get('encode_tokens', 0)} tokens from {ph.get('prompt_chars', 0)} chars"
+                     f"{f', {reused} chars reused' if reused else ''}{rate})")
+        known += ph["encode_ms"]
+    if ph.get("queue_ms") is not None:
+        parts.append(f"queue {ph['queue_ms']:.0f} ms")
+        known += ph["queue_ms"]
+    if engine_prompt_ms is not None:
+        parts.append(f"engine prompt {float(engine_prompt_ms):.0f} ms")
+        known += float(engine_prompt_ms)
+    if not parts:
+        return None
+    if ph.get("ttft_ms") is not None:
+        parts.append(f"first token {ph['ttft_ms']:.0f} ms after the request arrived (other {max(0.0, ph['ttft_ms'] - known):.0f} ms)")
+    return f"[strata] request {request_id} server phases: " + ", ".join(parts)
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -6630,6 +6718,7 @@ def make_handler(svc: Service):
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _post(self):
+            svc.phase_begin()                   # the clock of server_ttft_ms: the request has arrived
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -8250,10 +8339,16 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    warm_mode, warm_parks = "off", 0
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
         cfg = with_component_engine(cfg)
+        from serve import warmup                    # the start-up warm-up: checked now, before the minutes of loading
+        try:
+            warm_mode, warm_parks = warmup.settings(cfg)
+        except ValueError as e:
+            raise SystemExit(f"[strata] {e}")
         vision = None
         # The engine's own environment. It carries the offline policy too: an engine that fetched a
         # missing shard or a plugin would break the promise the flag makes.
@@ -8516,6 +8611,35 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    if a.engine == "strata" and warm_mode != "off":
+        # The engine said READY; the port is still closed (serve() below binds it), so a health check says "starting"
+        # and no client is queued behind these requests.  docs/TTFT_WARMUP.md section 2.
+        if lazy:
+            print("[strata] warm-up skipped: the model loads with the first request (lazy start)", flush=True)
+        elif groups:
+            print("[strata] warm-up skipped: replicas (it would warm one engine only)", flush=True)
+        else:
+            try:
+                warmup.run_blocking(svc, warm_mode, warm_parks, log=lambda line: print(line, flush=True))
+            except KeyboardInterrupt:                   # stopped while warming up: the clean stop of the loop below
+                print("\n[strata] stopping during the warm-up ...", flush=True)
+                for close in (getattr(engine, "close", None), vision.shutdown if vision else None,
+                              hub.close if hub is not None else None):
+                    try:
+                        if close:
+                            close()
+                    except KeyboardInterrupt:
+                        if getattr(engine, "proc", None):
+                            engine.proc.kill()
+                    except Exception as e:  # noqa: BLE001 - the stop goes on
+                        print(f"[strata] could not close cleanly: {e}", flush=True)
+                finished.set()
+                print("[strata] stopped", flush=True)
+                exit_code = interrupt_exit_code if termination == "sigint" else 0
+                notify_lifecycle("stopped", {"instance_id": svc.instance_id,
+                                             "reason": termination, "drained": True, "cancelled_requests": 0,
+                                             "exit_code": exit_code})
+                return exit_code
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()

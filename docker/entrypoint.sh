@@ -190,5 +190,5 @@ if [ -n "${LLMSERVE_SERVER_ARGS:-}" ]; then
   read -r -a extra <<<"$LLMSERVE_SERVER_ARGS"
   server_args+=("${extra[@]}")
 fi
-say "starting the server on port $PORT (loading the model takes a few minutes; /health answers when it is ready)"
+say "starting the server on port $PORT (loading the model takes a few minutes, then the warm-up LLMSERVE_WARMUP=${LLMSERVE_WARMUP:-full} runs; the port opens and /health answers when that is done)"
 exec python -m serve.server "${server_args[@]}"

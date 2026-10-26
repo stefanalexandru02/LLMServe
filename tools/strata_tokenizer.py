@@ -424,6 +424,7 @@ class PromptEncoder:
         self.entries: list[tuple[str, tuple, list[int], list[int], list[int]]] = []
         self.lock = threading.Lock()
         self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
+        self._local = threading.local()                 # ... and the same figure per calling thread (reused_here)
 
     def encode(self, text: str, plain=(), store: bool = True) -> list[int]:
         plain = tuple(sorted(plain))
@@ -439,7 +440,7 @@ class PromptEncoder:
         if src is None:
             ids, marks = self.tok.encode_marked(text, parse_special=True, plain=plain)
             ends, counts = [m[0] for m in marks], [m[1] for m in marks]
-            self.last_reused = 0
+            self.last_reused = self._local.reused = 0
         else:
             c, n = src[3][cut_k], src[4][cut_k]
             rest = tuple((max(x - c, 0), y - c) for x, y in plain if y > c)
@@ -447,7 +448,7 @@ class PromptEncoder:
             ids = src[2][:n] + tail
             ends = src[3][:cut_k + 1] + [c + m[0] for m in marks]
             counts = src[4][:cut_k + 1] + [n + m[1] for m in marks]
-            self.last_reused = c
+            self.last_reused = self._local.reused = c
         if not store:
             return ids
         # every rendered prompt starts with the template's header, so sharing a special boundary does not make two
@@ -456,6 +457,11 @@ class PromptEncoder:
         with self.lock:
             self.entries = [(text, plain, ids, ends, counts)] + [e for e in self.entries if e is not old][:self.keep - 1]
         return list(ids)
+
+    def reused_here(self) -> int:
+        """Characters the calling thread's last encode() took from an earlier prompt (last_reused is the last one of any
+        thread, which another request can overwrite between the encode and the read)."""
+        return getattr(self._local, "reused", 0)
 
     def forget(self, ids: list[int]) -> None:
         """The prompt with these ids was refused: it is not kept."""

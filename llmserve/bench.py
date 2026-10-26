@@ -20,10 +20,20 @@ predicted_per_second, cache_n, draft_n, draft_n_accepted) when the last chunk ca
 first token (TTFT), wall time and a decode rate = (completion_tokens - 1) / (last token time - first token time). The client
 decode rate is the fallback when the server sends no `timings`; the first token is excluded because it arrives at the start of
 the interval being timed.
+
+The server's own phases (LLMServe 0.2+ puts them in `timings`: server_render_ms, server_encode_ms, server_queue_ms,
+server_ttft_ms, ...) get a row each in the per-case table and in --compare when the server sends them: where the time
+between "request received" and "first token" went outside the engine (template, tokenizer, wait for the engine's turn).
+
+Output identity check (does an engine or setting switch change what the model says?): run the same command against both
+configurations with `--fixed-id X --save-text` (prompts become byte-identical between the two runs, temperature is 0) and then
+`--compare a.json b.json`: for every case and run it says whether the two texts are identical and, if not, the first
+differing character and the words around it.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import math
@@ -380,6 +390,13 @@ def run_metrics(stream: dict) -> dict:
         "draft_n": draft_n, "draft_n_accepted": draft_ok,
         "draft_accept": (draft_ok / draft_n) if draft_n and draft_ok is not None else None,
         "finish_reason": stream.get("finish_reason"),
+        "engine_prompt_ms": _num(timings.get("prompt_ms")),
+        "server_render_ms": _num(timings.get("server_render_ms")), "server_encode_ms": _num(timings.get("server_encode_ms")),
+        "server_queue_ms": _num(timings.get("server_queue_ms")), "server_ttft_ms": _num(timings.get("server_ttft_ms")),
+        "server_encode_tokens": _num(timings.get("server_encode_tokens")),
+        "server_encode_reused_chars": _num(timings.get("server_encode_reused_chars")),
+        "client_extra_ms": (ttft * 1000.0 - _num(timings.get("server_ttft_ms")))
+        if ttft is not None and _num(timings.get("server_ttft_ms")) is not None else None,
         "timings": stream.get("timings"), "usage": stream.get("usage"),
     }
 
@@ -401,11 +418,18 @@ def chat_payload_messages(model: str, messages: list, max_tokens: int) -> dict:
     }
 
 
-def run_request(client: Client, model: str, case: str, max_tokens: int) -> dict:
-    stream = client.stream_chat(chat_payload(model, make_prompt(case), max_tokens))
+def run_request(client: Client, model: str, case: str, max_tokens: int, nonce=None, keep_text: bool = False) -> dict:
+    """One measured request.  `nonce`: the run id on the prompt's first line (default a new uuid4); `keep_text`: the answer
+    text and a hash of the prompt go into the result too (--save-text, --fixed-id: the output identity check)."""
+    prompt = make_prompt(case, nonce)
+    stream = client.stream_chat(chat_payload(model, prompt, max_tokens))
     if stream["first_s"] is None:
         raise BenchError("the server streamed no text for case %s (finish_reason=%s)" % (case, stream.get("finish_reason")))
-    return run_metrics(stream)
+    r = run_metrics(stream)
+    if keep_text:
+        r["text"] = stream.get("text") or ""
+        r["prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+    return r
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -422,6 +446,14 @@ METRICS = [
     ("completion_tokens", "completion tokens", "%.0f", 0),
     ("cache_n", "cached prompt tokens", "%.0f", 0),
     ("draft_accept", "draft acceptance", "pct", 1),
+    # the server's own phases (only when it sends them in `timings`): ms from the request's arrival to the first token
+    ("server_render_ms", "server: template (ms)", "%.0f", -1),
+    ("server_encode_ms", "server: tokenize (ms)", "%.0f", -1),
+    ("server_encode_reused_chars", "server: chars reused", "%.0f", 0),
+    ("server_queue_ms", "server: queue wait (ms)", "%.0f", -1),
+    ("engine_prompt_ms", "engine: prompt (ms)", "%.0f", -1),
+    ("server_ttft_ms", "server: TTFT (ms)", "%.0f", -1),
+    ("client_extra_ms", "client TTFT - server (ms)", "%.0f", -1),
 ]
 
 
@@ -511,6 +543,71 @@ def pct_diff(a, b):
     return (b - a) / abs(a) * 100.0
 
 
+def compare_texts(a: str, b: str, words: int = 6) -> dict:
+    """Are two generated texts the same?  -> {identical, offset, len_a, len_b, before, a_next, b_next}: `offset` is the first
+    differing character (the length of the shorter text when one is a prefix of the other), `before` the last `words`
+    words in front of it (the start of the word the difference falls in included), `a_next` / `b_next` the next `words`
+    words of each from there ("token-ish": the model's tokens are word pieces, so a word is the unit worth showing)."""
+    n = min(len(a), len(b))
+    k = 0
+    while k < n and a[k] == b[k]:
+        k += 1
+    if k == len(a) == len(b):
+        return {"identical": True, "offset": None, "len_a": len(a), "len_b": len(b)}
+    start = k
+    while start > 0 and not a[start - 1].isspace():          # back to the start of the word the difference is in
+        start -= 1
+    before = a[:start].split()[-words:]
+    return {"identical": False, "offset": k, "len_a": len(a), "len_b": len(b),
+            "before": " ".join(before), "a_next": " ".join(a[start:].split()[:words]) if k < len(a) else "<end of text>",
+            "b_next": " ".join(b[start:].split()[:words]) if k < len(b) else "<end of text>"}
+
+
+def identity_report(a: dict, b: dict, name_a: str, name_b: str) -> list:
+    """Lines about whether the two files' saved answers (--save-text) are identical, per case and run.  Empty when neither
+    file has texts."""
+    lines, same, total, no_text = [], 0, 0, []
+    for case in [c for c in a["cases"] if c in b["cases"]]:
+        ra, rb = a["cases"][case].get("runs") or [], b["cases"][case].get("runs") or []
+        for i, (x, y) in enumerate(zip(ra, rb), 1):
+            if not isinstance(x.get("text"), str) or not isinstance(y.get("text"), str):
+                no_text.append("%s run %d" % (case, i))
+                continue
+            total += 1
+            cmp = compare_texts(x["text"], y["text"])
+            tag = "%s run %d" % (case, i)
+            note = ""
+            if x.get("prompt_sha256") and y.get("prompt_sha256") and x["prompt_sha256"] != y["prompt_sha256"]:
+                note = "  (the prompts differ: another --fixed-id, case or bench version, so a difference proves nothing)"
+            if cmp["identical"]:
+                same += 1
+                lines.append("  %-18s identical (%d characters, %s tokens)%s" % (
+                    tag, cmp["len_a"], x.get("completion_tokens") if x.get("completion_tokens") == y.get("completion_tokens")
+                    else "%s vs %s" % (x.get("completion_tokens"), y.get("completion_tokens")), note))
+            else:
+                lines.append("  %-18s DIFFERENT at character %d (%s has %d characters / %s tokens, %s has %d / %s)%s" % (
+                    tag, cmp["offset"], name_a, cmp["len_a"], x.get("completion_tokens"), name_b, cmp["len_b"],
+                    y.get("completion_tokens"), note))
+                lines.append("      same up to: ...%s" % cmp["before"])
+                lines.append("      %-10s %s" % (name_a[:10], cmp["a_next"]))
+                lines.append("      %-10s %s" % (name_b[:10], cmp["b_next"]))
+    if not total and not no_text:
+        return []
+    if not total and not any(isinstance(r.get("text"), str) for d in (a, b) for c in d["cases"].values()
+                             for r in c.get("runs") or []):
+        return []                                           # neither file was run with --save-text: nothing to say
+    out = ["", "== output identity (temperature 0; the same prompt, run by run) =="]
+    if total:
+        out.append("%d of %d run(s) produced identical text%s" % (same, total, "" if same == total else
+                   "; the others diverge (MTP/speculation, batching and different kernels can legitimately change a few "
+                   "tokens on some GPUs: look at where, and whether it is a different word or a different answer)"))
+        out.extend(lines)
+    if no_text:
+        out.append("not compared, no saved text in one of the files (run both with --save-text): " + ", ".join(no_text[:12])
+                   + (" ..." if len(no_text) > 12 else ""))
+    return out
+
+
 def compare_results(a: dict, b: dict, name_a: str, name_b: str, same_threshold: float = 2.0) -> str:
     out = []
     for tag, d, name in (("A", a, name_a), ("B", b, name_b)):
@@ -556,6 +653,7 @@ def compare_results(a: dict, b: dict, name_a: str, name_b: str, same_threshold: 
             mt = (d.get("args") or {}).get("max_tokens")
             for n in (case_notes(runs, mt) if mt else []):
                 out.append("note (%s): %s" % (tag, n))
+    out.extend(identity_report(a, b, name_a, name_b))
     if skipped:
         out.append("")
         out.append("not compared (only in one file): " + ", ".join(skipped))
@@ -1234,6 +1332,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", default="", metavar="FILE.json", help="write the raw results here")
     ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"), help="print two saved results side by side and exit")
     ap.add_argument("--timeout", type=float, default=1800.0, help="seconds to wait for the server per request (default %(default)s)")
+    ap.add_argument("--fixed-id", default=None, metavar="STR",
+                    help="output identity check: the run id on the prompt's first line is STR-r<run number> instead of a random "
+                         "one (STR-warmup for the warm-up), so the same command against two servers sends byte-identical "
+                         "prompts; runs of one file still differ from each other, so no prompt cache serves a later run. "
+                         "Use with --save-text; single-stream mode only")
+    ap.add_argument("--save-text", action="store_true",
+                    help="store each run's generated text (and a hash of its prompt) in the --out JSON; --compare then says per "
+                         "case and run whether the two files' texts are identical, and where they first differ")
     g = ap.add_argument_group("concurrency mode", "--concurrency switches it on; --runs is the number of rounds per level and "
                               "--max-tokens the answer length of each request.")
     g.add_argument("--concurrency", default=None, metavar="1,2,3,4",
@@ -1288,6 +1394,13 @@ def do_bench(args) -> int:
         raise BenchError("--max-tokens must be at least 1")
     if not args.concurrency and (args.scenario is not None or args.prefix_tokens is not None):
         raise BenchError("--scenario and --prefix-tokens belong to the concurrency mode: add --concurrency 1,2,3")
+    if args.fixed_id is not None and (not args.fixed_id.strip() or "\n" in args.fixed_id or "\r" in args.fixed_id):
+        raise BenchError("--fixed-id needs a short text on one line, e.g. --fixed-id identity-1")
+    if args.concurrency and (args.fixed_id is not None or args.save_text):
+        raise BenchError("--fixed-id and --save-text belong to the single-stream mode (drop --concurrency)")
+    if args.fixed_id is not None and not args.save_text:
+        say("note: --fixed-id without --save-text sends identical prompts but saves no text to compare")
+    keep_text = bool(args.save_text or args.fixed_id is not None)
     cases = parse_cases(args.cases)
     client = Client(args.url, args.api_key, args.timeout)
     say("server: %s" % client.base)
@@ -1317,7 +1430,8 @@ def do_bench(args) -> int:
     result = {
         "version": RESULT_VERSION, "label": args.label, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "url": client.base, "model": model, "props": props,
-        "args": {"runs": args.runs, "cases": cases, "max_tokens": args.max_tokens},
+        "args": {"runs": args.runs, "cases": cases, "max_tokens": args.max_tokens, "fixed_id": args.fixed_id,
+                 "save_text": bool(args.save_text)},
         "python": sys.version.split()[0], "cases": {},
     }
 
@@ -1346,13 +1460,15 @@ def do_bench(args) -> int:
 
     try:
         say("warm-up (short, max_tokens %d), not counted ..." % WARMUP_MAX_TOKENS)
-        w = run_request(client, model, "short", WARMUP_MAX_TOKENS)
+        w = run_request(client, model, "short", WARMUP_MAX_TOKENS,
+                        nonce=("%s-warmup" % args.fixed_id) if args.fixed_id is not None else None)
         say("  warm-up: %s tokens in %.1f s" % (w.get("completion_tokens"), w.get("wall_s") or 0))
         for case in cases:
             runs = []
             result["cases"][case] = {"runs": runs}
             for i in range(1, args.runs + 1):
-                r = run_request(client, model, case, args.max_tokens)
+                r = run_request(client, model, case, args.max_tokens, keep_text=keep_text,
+                                nonce=("%s-r%d" % (args.fixed_id, i)) if args.fixed_id is not None else None)
                 runs.append(r)
                 say("  %s run %d/%d: prompt %s tok (%s tok/s), decode %s tok (%s tok/s), TTFT %s s"
                     % (case, i, args.runs, fmt(r["prompt_tokens"], "%.0f"), fmt(r["prompt_tps"], "%.1f"),

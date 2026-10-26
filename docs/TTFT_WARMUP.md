@@ -90,3 +90,70 @@ Set `LLMSERVE_ENGINE_ENV="STRATA_TRACE=1 STRATA_PREFILL_TIMING=1 STRATA_DECODE_T
 - After one long session, copy the converged `pcie_frac` from the last "PCIe share" log line into `LLMSERVE_EXTRA_ARGS="--pcie-frac X"`. That value always wins, so the first decode is warm from the start.
 - Turn on the `expert_profile_save` config key so the learned residency survives restarts.
 - To check: compare `DONE experts_streamed=`, the `ple` phase of `STRATA_PREFILL_TIMING` and the PCIe-share lines between the first and the third request after a restart.
+
+## 3. Implemented (server start-up warm-up)
+
+**Where:** `serve/warmup.py`, called from `main()` in `serve/server.py` right before `serve(svc, ...)`. Verified: `serve()` is the call that creates and binds the
+`ThreadingHTTPServer` (`Server((host, port), ...)`); `main()` only checks that the port is free (and closes that probe socket) before the minutes of loading. So during the warm-up
+nothing listens, `docker/healthcheck.sh`'s `curl` fails, and the container stays `starting` (inside `--start-period=2h`). The ready file and the lifecycle `ready` event come after it too.
+`/health` did not need a change. SIGTERM / Ctrl+C during the warm-up cancels the request in flight (the engine gets STOP), closes the engine and exits.
+
+**Config:** `"warmup": "off"|"short"|"full"` and `"warmup_parks": N` in `cfg.json`, written by `llmserve/prepare.py` from `LLMSERVE_WARMUP` (default `full`) and
+`LLMSERVE_WARMUP_PARKS` (default 4, 0-64). The same two variables, when set in the server's environment, override the file (so `LLMSERVE_SKIP_PREPARE=1` works too). Neither is in the
+prepare fingerprint (changing them redoes no download or pack), but `up_to_date()` compares them with `cfg.json`, and if only they differ `prepare --if-changed` rewrites those two keys.
+A wrong value stops the start early (before the model loads). Without the keys (a hand-written config) the server uses `full`, 4. Skipped for a lazy start, replicas and the mock engine.
+
+**Requests** (one user message each, no system prompt, thinking off, greedy: `temperature 0`, `presence_penalty 0` so the model card's 1.5 does not switch the penalty path on),
+through `Service.prepare` and `Service.run`, i.e. the template, the tokenizer/PromptEncoder, the queue, `StrataEngine.generate` and its line protocol, as an HTTP request goes:
+
+| # | request | `strata_checkpoint` | mode |
+|---|---|---|---|
+| 1 | ~16K tokens (python, C++, TypeScript, Rust, Go, SQL, shell, prose, diffs, traces, YAML, JSON tool calls), 1 new token | `false` | full (short: ~2K) |
+| 2 | ~1K tokens, up to 768 new tokens (asked to write at least 1500 words so it does not stop early; the log warns if it ends under 90%) | `false` | full |
+| 3 | N short different conversations (each starts with its own number), 8 new tokens | not set: the engine keeps and parks them | full, short (if N > 0) |
+| 4 | ~120 tokens, 16 new tokens | `false` | full, short |
+
+Request 4 is last on purpose. When the engine starts a request it parks the conversation that is live (if it is `live_ok`). After request 3's last conversation that is conversation N,
+so request 4 makes it the Nth park, and being `ckpt=0` it leaves nothing live: the first real request finds a full cache and parks nothing. N parks need N conversations, not N+1.
+N is capped at the engine's `--conversation-cache-slots` (default 4) and dropped when the engine reports `conversation_cache_mib=0` or runs batch slots.
+The text is deterministic (seeded), so every start routes the same experts. After the warm-up the server puts back its history, totals, latency histograms and `last_timings`, and empties
+the PromptEncoder, so `/metrics` starts at zero requests.
+
+**Does `strata_checkpoint: false` really avoid parking?** (`src/program/generate.cpp`, read-only check.) For the request itself: yes. `req_ckpt` is set from `ckpt=0` (`:12375`); then
+`turn_at = -1` (`:14035`, no split at the last `<|im_start|>`, so no turn checkpoint), `pp_next_check = INT64_MAX` and `pp_tail_saved = true` (`:13083-13084`, no periodic and no tail checkpoint),
+`message_checkpoint_boundary(.., turn_at = -1, ..)` returns -1, and after the request `live_ok = o.prompt_cache > 0 && req_ckpt` is false (`:15300`), so the session is neither continued by the
+next request (`:12626`) nor parked (`park_current_body` returns at `!live_ok`, `:9497`). **Two things it does not stop:** (1) the conversation that was live when the request *starts* is still
+parked (nothing is live at start-up, so nothing happens; after real traffic a `ckpt=0` request would still park the user's conversation); (2) the system-prompt root checkpoint
+(`root_at`, `:14037-14041`) is still taken when the first turn boundary lies at `--prompt-cache-root` (2048) tokens or later and is pinned: a 16K warm-up with a long *system* message would pin
+one. The warm-up prompts are one user message, so they never reach it (the test checks that each prompt has exactly one `<|im_start|>` besides the assistant header). Also not stopped: the adaptive
+expert tier learns from the text (wanted), and a request that resumes from a checkpoint it matches is unaffected. Under `--batch` the `BGEN` path is separate code that I did not trace.
+
+**Parked warm-up conversations and the cache.** `ConversationCache::put` appends; `make_room` and the RAM-admission loop evict `evict_oldest()` first (`entries_` is "least recently active first"),
+so the warm-up entries leave before any later one: the first real park finds the cache full and evicts warm-up conversation 1. Each is a short conversation (~100 tokens): one
+running-state snapshot plus one turn checkpoint, ~240 MB, the figure the engine log gives for a short park. Nothing later matches them (a checkpoint matches only when its tokens are a prefix of
+the new prompt) and a real prompt of 2K+ tokens parks into a slot freed by one of them. What the pre-touch buys is the *first-touch* cost under WSL2: after the evictions the buffers are freed
+(16 MiB segments, returned to the guest kernel) but the pages already belong to the VM. The engine's own log lines ("conversation cache: parked N tokens in X ms") show whether it worked.
+
+**Expected log** (times are examples; the 16K and decode figures are the estimates above, not measurements):
+
+```
+[strata] warm-up (full): 7 requests (4 conversations to park); the port opens when it is done (the health check says starting until then)
+[strata] warm-up 1/7 prefill ~16,376 tokens, 1 new token: 8.1 s (prompt 16,4xx tokens, engine prompt 7.8 s)
+[strata] warm-up 2/7 decode ~1,024-token prompt, up to 768 new tokens: 8.6 s (prompt 1,0xx tokens, engine prompt 0.9 s, 768 tokens at 104 tok/s)
+[strata] warm-up 3/7 conversation 1 of 4 (kept by the engine): 2.4 s (prompt 1xx tokens, engine prompt 2.1 s)
+[strata] warm-up 4/7 conversation 2 of 4 (kept by the engine): 4.6 s ...
+[strata] warm-up 7/7 short ~120-token prompt, 16 new tokens: 3.0 s (prompt 1xx tokens, engine prompt 2.8 s, 16 tokens at 90 tok/s)
+[strata] warm-up done in 36.4 s
+[strata] warm-up, engine log: PCIe share: ... -> pcie_frac 0.60 (was 0.20)
+[strata] warm-up, engine log: 4 conversation(s) parked: parked 1xx tokens in 2169.3 ms; ...
+```
+
+Between those lines the server also prints its usual `[strata] done: ...` and `request ... server phases: ...` line per warm-up request. If the engine log has no `PCIe share` line the summary says so.
+(`LLMSERVE_ENGINE_ENV="STRATA_TRACE=1 STRATA_PREFILL_TIMING=1"` adds the engine's own phase lines to `engine.log`.)
+
+**Not done / limits.** With `--conversation-cache-min-tokens` above ~150 in `LLMSERVE_EXTRA_ARGS` the engine skips parking the short warm-up conversations (`skip parking (.. tokens, below the .. minimum`), so the parks do nothing (set `LLMSERVE_WARMUP_PARKS=0`). After an idle unload (`idle_unload_s`) or an engine restart the engine is cold again and nothing re-runs the warm-up. Replicas are not warmed. The ~30-60 s total is an estimate until it is
+run on the 4090. The warm-up heats the tiers and buffers, it does not fix the per-request costs of section 1 (`--short-read`, the turn checkpoint, lend/refill); those stay for the engine work.
+
+**Per-request phases (same change set).** The server now logs `[strata] request <id> server phases: render .. ms, encode .. ms (N tokens from C chars, [K chars reused | R tok/s]), queue .. ms, engine prompt .. ms, first token .. ms
+after the request arrived (other .. ms)` and puts `server_render_ms`, `server_encode_ms`, `server_encode_tokens`, `server_prompt_chars`, `server_encode_reused_chars`, `server_queue_ms`, `server_ttft_ms` into `timings`
+(and the `/metrics` history rows). That is what the BENCHMARKS.md trace asked for to locate the 2-3 s gap at 16K. `tools/tokenizer_bench.py` measures the tokenizer alone; see the README.
