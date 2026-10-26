@@ -1,5 +1,4 @@
-# tools/vision - strata-vision, the image encoder for Strata's multimodal path (optional; setup.py builds it when
-# the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
+# tools/vision - strata-vision, the image encoder for Strata's multimodal path (optional; build it when images are wanted).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
 #
 #   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
 #         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native] [-DSTRATA_PORTABLE=OFF]
@@ -9,7 +8,7 @@
 #
 # Portable (AVX2 baseline) is the default, so an encoder built without extra flags runs on any AVX2 PC: the 0.1.32
 # release's encoder was built native on an AVX-512 machine and stopped with an illegal instruction elsewhere
-# (#411 #412 #419).  setup.py, which builds for the PC it runs on, passes -DSTRATA_PORTABLE=OFF.  The option is
+# (#411 #412 #419).  A build for the PC it runs on can pass -DSTRATA_PORTABLE=OFF.  The option is
 # kept in CMakeCache.txt, so a build folder configured before this default still needs the flag (or a fresh folder).
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
@@ -134,14 +133,3 @@ if(STRATA_VISION_SYCL AND UNIX AND NOT APPLE)
   get_filename_component(_icpx_lib "${_icpx_bin}/../lib" ABSOLUTE)
   set_target_properties(strata-vision PROPERTIES INSTALL_RPATH "$ORIGIN;${_icpx_lib}")
 endif()
-
-# opens a GGUF that has tensor types llama.cpp does not know (a Gyro quantization's TQK6 / TQK7) for its vocabulary only
-add_executable(strata-vision-gguf-test EXCLUDE_FROM_ALL gguf_meta_test.cpp)
-target_link_libraries(strata-vision-gguf-test PRIVATE llama)
-target_compile_features(strata-vision-gguf-test PRIVATE cxx_std_17)
-set_target_properties(strata-vision-gguf-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-# the HIP reader's architecture check (gpu_arch.h), without a GPU
-add_executable(strata-vision-arch-test EXCLUDE_FROM_ALL gpu_arch_test.cpp)
-target_compile_features(strata-vision-arch-test PRIVATE cxx_std_17)
-set_target_properties(strata-vision-arch-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

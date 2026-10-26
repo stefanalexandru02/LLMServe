@@ -1,8 +1,8 @@
 """tools/canonical_xcheck.py - P1.T3 in prototype: does the canonical form round-trip BIT-EXACTLY?
 
 P1.S6's release-blocking test is `dequant(canonical) == dequant_ggml(original)` bit for bit, for every tensor
-of the real GGUF. This is that test in Python, before the C++ exists - the same order that worked for `ref/`
-(the oracle before the engine), and faster to iterate.
+of the real GGUF. This is that test in Python, before the C++ exists - the same order that worked for the
+Python oracle before the engine, and faster to iterate.
 
 It starts with `Q2_0 -> S2`, which is both the largest mapping (31.64 GiB, the 202 routed-expert tensors) and
 the one whose codebook has a non-obvious feature:
@@ -36,11 +36,33 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, REPO)
 sys.path.insert(0, HERE)
-sys.path.insert(0, os.path.join(REPO, "ref"))
 
 import gguf_reader as G                                    # noqa: E402
 from gguf_writer import dequantize_q2_0                    # noqa: E402
-from load import _dequant_flat                             # noqa: E402
+
+
+
+def _bf16_to_f32(raw: np.ndarray) -> np.ndarray:
+    return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def _dequant_flat(type_name: str, raw: np.ndarray) -> np.ndarray:
+    """One dequantization dispatch (it used to live in ref/load.py, which this fork no longer carries).
+
+    Q2_0 is this project's own decoder because gguf-py's enum cannot represent type 42 in older checkouts;
+    everything else goes through gguf-py, the reference this project validates its C++ against.
+    """
+    if type_name == "Q2_0":
+        return dequantize_q2_0(raw.tobytes())
+    if type_name == "BF16":
+        return _bf16_to_f32(raw)
+    if type_name == "F32":
+        return raw.view(np.float32)
+    if type_name == "F16":
+        return raw.view(np.float16).astype(np.float32)
+    from gguf import quants, GGMLQuantizationType as Q
+    return quants.dequantize(raw, Q[type_name]).astype(np.float32)
+
 
 # default: $STRATA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
 SHARD1 = os.environ.get("STRATA_SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",

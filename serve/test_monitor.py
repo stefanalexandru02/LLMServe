@@ -187,15 +187,14 @@ class Monitor(unittest.TestCase):
         self.assertLess(records[1]["load_s"], records[0]["load_s"])
         self.assertTrue(all(r["state"] == "completed" for r in records))
 
-    def test_page_and_relative_assets_are_served(self):
-        code, html = self.request("/api-monitor")
-        self.assertEqual(code, 200)
-        self.assertIn('src="/web/monitor.js"', html)
-        code, script = self.request("/web/monitor.js")
-        self.assertEqual(code, 200)
-        self.assertIn("textContent", script)
-        self.assertNotIn("innerHTML", script)
-        self.assertEqual(self.request("/web/../server.py")[0], 404)
+    def test_root_and_monitor_paths_answer_with_json_not_a_page(self):
+        for path in ("/", "/api-monitor"):
+            code, info = self.request(path)
+            self.assertEqual(code, 200)
+            self.assertEqual(info["name"], "llmserve")
+            self.assertIn("/v1/chat/completions", info["endpoints"])
+            self.assertIn("/api/requests", info["endpoints"])    # the monitor is on in this class
+        self.assertEqual(self.request("/web/monitor.js")[0], 404)    # no web app in this fork
 
 
 class ConversationCacheCard(unittest.TestCase):
@@ -252,14 +251,3 @@ class ConversationCacheCard(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
-
-    def test_the_card_is_on_the_page(self):
-        web = Path(__file__).parent / "web"
-        html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
-        for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
-            self.assertIn(f'id="{el}"', html)
-            self.assertIn(f'"{el}"', js)
-
-
-if __name__ == "__main__":
-    unittest.main()

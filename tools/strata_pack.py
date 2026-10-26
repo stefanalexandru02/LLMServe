@@ -32,7 +32,6 @@ import numpy as np
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "ref"))
 
 import gguf_reader as G                                                    # noqa: E402
 import pack_layer as PL                                                    # noqa: E402

@@ -201,8 +201,6 @@ VISION_START = "<|vision_start|>"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
-DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when neither the request nor the config names one
-DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
 ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
@@ -3479,23 +3477,6 @@ def hip_auto_devices(cfg: dict, env: dict) -> list[int] | None:
     return visible
 
 
-DS41_SLOT_KEEP_DEFAULT = "1"      # the engine keeps a displaced conversation in RAM and in the slot folder (see below)
-DS41_SLOT_GB_DEFAULT = "2"        # the folder's cap in GB (a 6.5K-token conversation is about 17 MB)
-
-
-def deepseek_slot_env(env: dict, cfg: dict) -> None:
-    """DeepSeek-V4.1 only.  The engine sets a conversation aside when another request takes the model and takes it back
-    at its checkpoints (agents and sub-agents that take turns do not read their prompts again).  STRATA_DS4_SLOT_KEEP
-    switches it (the default above; a config's env or the shell wins); the folder is `ds4-slots` next to the run log, in
-    Strata's data folder (STRATA_DS4_SLOT_DIR names another), and the engine caps it (STRATA_DS4_SLOT_GB, 2 here, 16 in the engine) and
-    removes what is older than a week or not this model's.  On by default; STRATA_DS4_SLOT_KEEP=0 turns it off."""
-    env.setdefault("STRATA_DS4_SLOT_KEEP", DS41_SLOT_KEEP_DEFAULT)
-    env.setdefault("STRATA_DS4_SLOT_GB", DS41_SLOT_GB_DEFAULT)
-    log = cfg.get("log")
-    if "STRATA_DS4_SLOT_DIR" not in env and log:
-        env["STRATA_DS4_SLOT_DIR"] = str(Path(log).parent / "ds4-slots")
-
-
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -3510,8 +3491,6 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in ordered_gpus(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
-    if (cfg.get("arch") or "") == "deepseek41":      # (only this engine reads these; Qwen's environment is untouched)
-        deepseek_slot_env(env, cfg)
     # Strict offline reaches children through the environment, because a tool subprocess or a model
     # loader is code this server does not own. Applied last so a profile's own `env` cannot remove
     # the policy by naming the same variable.
@@ -3923,7 +3902,7 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
-        self.family = None                              # the model family ("deepseek41"): set_family() below
+        self.family = None                              # the model family (None: the Qwen form this server was written for)
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
@@ -3938,15 +3917,9 @@ class Service:
                 else PromptEncoder(tokenizer)
 
     def set_family(self, family: str | None) -> None:
-        """A family whose text differs from the Qwen form this server was written for (DeepSeek-V4.1: its own end
-        token, DSML tool calls, reasoning-effort words).  The others keep the defaults."""
+        """A family whose text differs from the Qwen form this server was written for.  None keeps the defaults (the only
+        family this fork runs: Qwen3.8-Flash-Next, GGUF arch qwen4exp)."""
         self.family = family
-        if family == "deepseek41":
-            from serve import dsml
-            eos = (getattr(self.tok, "special_ids", None) or {}).get("eos", 1)
-            self.stop_ids = {int(eos)}
-            self.parser_cls = dsml.DsmlOutputParser
-            self._force_text = dsml.to_dsml_force
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -4162,8 +4135,6 @@ class Service:
             value = req.get("thinking_budget_tokens")
         if value is None:
             value = self.reasoning_budget_tokens
-            if not value and self.family == "deepseek41" and not self.reasoning_budget_configured:
-                value = DS41_DEFAULT_BUDGET          # DeepSeek-V4.1 only, as Maya ships it: no budget anywhere = this one
         if isinstance(value, float) and value.is_integer():
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
@@ -4918,29 +4889,9 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
-        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images:
-            lead = self.deepseek_shared_start(messages)
-            if lead:
-                req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
-
-    @staticmethod
-    def deepseek_shared_start(messages) -> int:
-        """DeepSeek-V4.1 only: how many leading messages are the system prompt (its tools are rendered with them).  An
-        agent and its sub-agents that work behind the same system prompt and tools share exactly this start, so the
-        engine keeps a checkpoint of its state there (pin=N): the next agent behind the same start goes back to it
-        instead of reading it again.  0: none (STRATA_DS4_AUTO_PIN=0, no system message, or nothing after it)."""
-        if os.environ.get("STRATA_DS4_AUTO_PIN", "1") == "0":
-            return 0
-        n = 0
-        for m in messages:
-            if isinstance(m, dict) and m.get("role") in ("system", "developer"):
-                n += 1
-            else:
-                break
-        return n if 0 < n < len(messages) else 0
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -5095,14 +5046,6 @@ class Service:
             # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
             budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
-                  "(\"answer_room\": false in the config turns this off)", flush=True)
-        if (thinking and not budget and self.answer_room and self.family == "deepseek41"
-                and max_new and DS41_SMALL_CAP_MIN <= max_new < ANSWER_ROOM_MIN_CAP):
-            # DeepSeek-V4.1 only: a short max_tokens (/v1/messages and /v1/chat/completions with 200-600) was spent
-            # entirely on the thinking, so no text block ever arrived.  With no budget of the client's own, the thinking
-            # is capped at half of max_tokens; then the wrap-up, </think> and the answer follow in the other half.
-            budget = max_new // 2
-            print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                   "(\"answer_room\": false in the config turns this off)", flush=True)
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
@@ -5926,7 +5869,7 @@ def openai_collect(chunks) -> dict:
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning).strip() and "".join(reasoning).strip() == "".join(content).strip():
-        reasoning = []              # a turn with no </think> (serve/dsml.py): the text is the answer; it is not also reasoning
+        reasoning = []              # a turn with no </think>: the text is the answer; it is not also reasoning
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
     if calls:
@@ -6065,7 +6008,7 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
-    for i in range(len(blocks) - 1):    # a turn with no </think> (serve/dsml.py): the text is the answer; it is not also a thinking block
+    for i in range(len(blocks) - 1):    # a turn with no </think>: the text is the answer; it is not also a thinking block
         a, b = blocks[i], blocks[i + 1]
         if a.get("type") == "thinking" and b.get("type") == "text" and a.get("thinking", "").strip() == b.get("text", "").strip():
             del blocks[i]
@@ -6372,39 +6315,6 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
-            if path.startswith("/fonts/"):
-                # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
-                name = path[len("/fonts/"):]
-                f = ROOT / "serve" / "web" / "fonts" / name
-                if "/" in name or "\\" in name or not name.endswith(".woff2") or not f.is_file():
-                    self._json(404, {"error": {"message": "not found"}})
-                    return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "font/woff2")
-                self.send_header("Cache-Control", "max-age=86400")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if path.startswith("/web/"):
-                # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
-                name = path[len("/web/"):]
-                types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                         ".svg": "image/svg+xml"}
-                f = ROOT / "serve" / "web" / name
-                ext = os.path.splitext(name)[1]
-                if "/" in name or "\\" in name or ext not in types or not f.is_file():
-                    self._json(404, {"error": {"message": "not found"}})
-                    return
-                body = f.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", types[ext])
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
             if path == "/metrics/prometheus":
                 if self._authorized():
                     body = svc.prometheus().encode()
@@ -6627,12 +6537,14 @@ def make_handler(svc: Service):
                     self._json(200, svc.mcp.status() if svc.mcp else {"servers": [], "tools": 0})
                 return
             if path == "" or (path == "/api-monitor" and svc.api_monitor):
-                body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                # headless: no web page, a pointer to the API instead
+                info = {"name": "llmserve", "engine": "strata", "api_key_required": bool(svc.api_key),
+                        "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens",
+                                      "/v1/responses", "/health", "/props", "/slots", "/metrics", "/metrics/prometheus",
+                                      "/v1/telemetry", "/v1/status"]}
+                if svc.api_monitor:
+                    info["endpoints"].append("/api/requests")        # the API request monitor's data (--api-monitor)
+                self._json(200, info)
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
@@ -8045,8 +7957,7 @@ def check_request_sampling(req) -> None:
 
 
 # the API's model name per model family (the GGUF architecture, "arch" in the config) when the config names none
-FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b",
-                      "deepseek41": "deepseek-v4.1-flash"}
+FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35b-a3b"}
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
@@ -8059,8 +7970,6 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
-    # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
-    "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
 }
 
 
@@ -8431,12 +8340,6 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
-    if (cfg.get("arch") or "") == "deepseek41":
-        from serve import dsml
-        tpl, swapped = dsml.pick_template(tpl)
-        if swapped:
-            print("[strata] this pack's chat template spells the tool-call block differently from the V4.1 model's; "
-                  "using the V4.1 template so tool calls come back as real calls", flush=True)
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
@@ -8447,7 +8350,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
